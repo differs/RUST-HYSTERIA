@@ -1,0 +1,24 @@
+[package]
+name = "hysteria-core"
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+
+[dependencies]
+bytes.workspace = true
+h3.workspace = true
+h3-quinn.workspace = true
+hysteria-extras = { path = "../extras" }
+http.workspace = true
+quinn.workspace = true
+quinn-proto.workspace = true
+rand.workspace = true
+rustls.workspace = true
+rustls-pemfile.workspace = true
+sha2.workspace = true
+socket2.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+
+[dev-dependencies]
+rcgen = "0.13.2"

@@ -1,0 +1,11 @@
+[package]
+name = "hysteria-extras"
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+
+[dependencies]
+blake2.workspace = true
+rand.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
