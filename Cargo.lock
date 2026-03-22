@@ -1790,6 +1790,7 @@ dependencies = [
  "jni 0.22.4",
  "ndk-context",
  "rustls",
+ "rustls-native-certs",
  "rustls-pemfile",
  "serde",
  "serde_yaml",

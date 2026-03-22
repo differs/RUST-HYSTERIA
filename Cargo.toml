@@ -28,3 +28,9 @@ tokio = { version = "=1.50.0", features = ["io-util", "macros", "net", "rt", "rt
 quinn = { path = "vendor/quinn" }
 quinn-proto = { path = "vendor/quinn-proto" }
 quinn-udp = { path = "vendor/quinn-udp" }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = "symbols"
+panic = "abort"

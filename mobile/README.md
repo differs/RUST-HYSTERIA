@@ -5,8 +5,9 @@ Android-first MVP client shell built with Dioxus 0.7.x.
 ## Current scope
 
 - paste/import `hy2://` / `hysteria2://` share URI
-- edit server/auth/obfs/TLS fields
-- edit CLI-compatible client bandwidth and QUIC tuning fields
+- edit a simplified draft flow with server/auth/optional obfs+SNI
+- keep explicit CA, pinning, bandwidth, and QUIC tuning under expert controls
+- use explicit `tls.ca` when provided, otherwise fall back to the system trust store
 - save / load / clear a local profile with Android `SharedPreferences`
 - push CA files into app storage over `adb` and select them in-app
 - connect / disconnect with `hysteria-core`

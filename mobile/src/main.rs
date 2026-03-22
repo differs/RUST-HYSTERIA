@@ -108,7 +108,7 @@ impl Default for FormState {
             quic_max_idle_timeout: String::new(),
             quic_keep_alive_period: String::new(),
             quic_disable_path_mtu_discovery: false,
-            insecure_tls: true,
+            insecure_tls: false,
         }
     }
 }
@@ -347,7 +347,7 @@ fn has_meaningful_form_prefill(form: &FormState) -> bool {
         || !form.quic_max_idle_timeout.trim().is_empty()
         || !form.quic_keep_alive_period.trim().is_empty()
         || form.quic_disable_path_mtu_discovery
-        || !form.insecure_tls
+        || form.insecure_tls
 }
 
 fn has_launch_automation(automation: LaunchAutomation) -> bool {
@@ -373,6 +373,43 @@ fn config_presence(value: &str) -> &'static str {
     } else {
         "<set>"
     }
+}
+
+fn current_trust_label(
+    form: &FormState,
+    ca_catalog: &CaCatalog,
+    imported_cert_name: &str,
+) -> String {
+    let mut parts = Vec::new();
+
+    if !form.ca_path.trim().is_empty() {
+        let explicit_label = if !imported_cert_name.trim().is_empty() {
+            imported_cert_name.trim().to_string()
+        } else if let Some(file) = ca_catalog
+            .files
+            .iter()
+            .find(|file| file.path == form.ca_path)
+        {
+            file.name.clone()
+        } else {
+            Path::new(form.ca_path.trim())
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or(form.ca_path.trim())
+                .to_string()
+        };
+        parts.push(explicit_label);
+    } else if form.insecure_tls {
+        parts.push("TLS insecure".to_string());
+    } else {
+        parts.push("System trust store".to_string());
+    }
+
+    if !form.pin_sha256.trim().is_empty() {
+        parts.push("pinSHA256".to_string());
+    }
+
+    parts.join(" + ")
 }
 
 fn button_style_with_state(base: impl AsRef<str>, enabled: bool) -> String {
@@ -402,7 +439,9 @@ impl Default for UiStatus {
         Self {
             phase: "Disconnected".to_string(),
             remote: String::new(),
-            detail: "Import a config, optionally import a certificate, then connect.".to_string(),
+            detail:
+                "Import a Linux-compatible config or fill server/auth, then connect. Explicit CA is optional."
+                    .to_string(),
             udp_enabled: false,
             negotiated_tx: 0,
             local_socks: format!("{LOCAL_SOCKS_HOST}:{LOCAL_SOCKS_PORT}"),
@@ -1921,23 +1960,11 @@ fn App() -> Element {
     } else {
         "No config imported".to_string()
     };
-    let current_cert_label = if !imported_cert_name_snapshot.trim().is_empty() {
-        imported_cert_name_snapshot.clone()
-    } else if let Some(file) = ca_catalog_snapshot
-        .files
-        .iter()
-        .find(|file| file.path == form_snapshot.ca_path)
-    {
-        file.name.clone()
-    } else if !form_snapshot.ca_path.trim().is_empty() {
-        Path::new(form_snapshot.ca_path.trim())
-            .file_name()
-            .and_then(|name| name.to_str())
-            .unwrap_or(form_snapshot.ca_path.trim())
-            .to_string()
-    } else {
-        "No certificate imported".to_string()
-    };
+    let current_trust_label = current_trust_label(
+        &form_snapshot,
+        &ca_catalog_snapshot,
+        &imported_cert_name_snapshot,
+    );
     let primary_action_label = if should_offer_disconnect(&status_snapshot.phase) {
         "Disconnect"
     } else if !status_snapshot.vpn_permission_granted {
@@ -1988,7 +2015,7 @@ fn App() -> Element {
                                     style: "display: flex; flex-direction: column; gap: 0; border-radius: 18px; background: rgba(255,255,255,0.03); border: 1px solid rgba(255,255,255,0.06); padding: 4px 16px;",
                                     StatusLine { label: "Config", value: current_config_label }
                                     StatusLine { label: "Endpoint", value: config_value_or_empty(&form_snapshot.server) }
-                                    StatusLine { label: "Certificate", value: current_cert_label }
+                                    StatusLine { label: "Trust", value: current_trust_label }
                                     StatusLine { label: "Remote", value: display_or_dash(&status_snapshot.remote) }
                                     StatusLine { label: "Session", value: online_duration.clone() }
                                     StatusLine { label: "Last connected", value: last_connected.clone() }
@@ -1999,10 +2026,17 @@ fn App() -> Element {
                                 style: panel_style(&prefs_snapshot),
                                 SectionHeader {
                                     title: "Import",
-                                    subtitle: "Load a client config and an optional CA certificate.".to_string(),
+                                    subtitle: "Load a Linux-compatible client config or share URI. Explicit CA files only matter when you want to override system trust.".to_string(),
                                 }
                                 div {
-                                    style: "display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px;",
+                                    style: format!(
+                                        "display: grid; grid-template-columns: {}; gap: 12px;",
+                                        if prefs_snapshot.show_advanced_fields {
+                                            "repeat(2, minmax(0, 1fr))"
+                                        } else {
+                                            "minmax(0, 1fr)"
+                                        }
+                                    ),
                                     PrimaryButton {
                                         label: "Import Config",
                                         disabled: false,
@@ -2012,20 +2046,27 @@ fn App() -> Element {
                                             Err(err) => append_log(&mut logs, format!("open config picker failed: {err:#}")),
                                         },
                                     }
-                                    PrimaryButton {
-                                        label: "Import Cert",
-                                        disabled: false,
-                                        secondary: true,
-                                        onclick: move |_| match android_bridge::request_ca_import() {
-                                            Ok(_) => append_log(&mut logs, "opened Android certificate picker".to_string()),
-                                            Err(err) => append_log(&mut logs, format!("open certificate picker failed: {err:#}")),
-                                        },
+                                    if prefs_snapshot.show_advanced_fields {
+                                        PrimaryButton {
+                                            label: "Import Cert",
+                                            disabled: false,
+                                            secondary: true,
+                                            onclick: move |_| match android_bridge::request_ca_import() {
+                                                Ok(_) => append_log(&mut logs, "opened Android certificate picker".to_string()),
+                                                Err(err) => append_log(&mut logs, format!("open certificate picker failed: {err:#}")),
+                                            },
+                                        }
                                     }
                                 }
-                                if !ca_catalog_snapshot.directory.trim().is_empty() {
+                                if prefs_snapshot.show_advanced_fields && !ca_catalog_snapshot.directory.trim().is_empty() {
                                     p {
                                         style: "margin: 14px 0 0; color: #6e7b91; font-size: 12px; line-height: 1.5;",
                                         "App CA directory: {ca_catalog_snapshot.directory}"
+                                    }
+                                } else if !prefs_snapshot.show_advanced_fields {
+                                    p {
+                                        style: "margin: 14px 0 0; color: #6e7b91; font-size: 12px; line-height: 1.5;",
+                                        "Need an explicit CA file or TLS debugging switches? Open Expert mode in Active Draft."
                                     }
                                 }
                             }
@@ -2203,62 +2244,62 @@ fn App() -> Element {
                                 style: panel_style(&prefs_snapshot),
                                 SectionHeader {
                                     title: "Active Draft",
-                                    subtitle: "Keep the mobile flow minimal: server, auth, CA, then connect. Expert transport controls stay hidden unless you explicitly open them.".to_string(),
+                                    subtitle: "Keep Android aligned with the Linux client: server, auth, optional obfs/SNI, then connect. If CA path is empty, the app falls back to the system trust store.".to_string(),
                                 }
                                 FieldRow { label: "Server", placeholder: "Host:port or hy2:// URI", value: form_snapshot.server.clone(), oninput: move |value| form.write().server = value }
                                 FieldRow { label: "Auth", placeholder: "Password or auth token", value: form_snapshot.auth.clone(), oninput: move |value| form.write().auth = value }
-                                FieldRow { label: "CA path", placeholder: "PEM file path inside app storage", value: form_snapshot.ca_path.clone(), oninput: move |value| form.write().ca_path = value }
-                                CaSelector {
-                                    directory: ca_catalog_snapshot.directory.clone(),
-                                    files: ca_catalog_snapshot.files.clone(),
-                                    selected_path: form_snapshot.ca_path.clone(),
-                                    onselect: move |path: String| {
-                                        form.write().ca_path = path.clone();
-                                        if path.trim().is_empty() {
-                                            append_log(&mut logs, "cleared CA path selection".to_string());
-                                        } else {
-                                            append_log(&mut logs, format!("selected CA path: {path}"));
-                                        }
-                                    },
-                                    onrefresh: move |_| {
-                                        match android_bridge::query_ca_catalog() {
-                                            Ok(catalog) => {
-                                                let count = catalog.files.len();
-                                                let directory = catalog.directory.clone();
-                                                ca_catalog.set(catalog);
-                                                if count == 0 {
-                                                    append_log(
-                                                        &mut logs,
-                                                        format!(
-                                                            "no CA files found in {}",
-                                                            config_value_or_empty(&directory)
-                                                        ),
-                                                    );
-                                                } else {
-                                                    append_log(
-                                                        &mut logs,
-                                                        format!(
-                                                            "refreshed CA catalog: {count} file(s) in {directory}"
-                                                        ),
-                                                    );
-                                                }
-                                            }
-                                            Err(err) => append_log(
-                                                &mut logs,
-                                                format!("refresh CA catalog failed: {err:#}"),
-                                            ),
-                                        }
-                                    }
-                                }
+                                FieldRow { label: "Salamander", placeholder: "Optional obfs password", value: form_snapshot.obfs_password.clone(), oninput: move |value| form.write().obfs_password = value }
+                                FieldRow { label: "TLS SNI", placeholder: "Optional SNI override", value: form_snapshot.sni.clone(), oninput: move |value| form.write().sni = value }
                                 if prefs_snapshot.show_advanced_fields {
                                     div {
                                         style: "display: flex; flex-direction: column;",
                                         p {
                                             style: "margin: 12px 0 0; color: #6e7b91; font-size: 12px; line-height: 1.5;",
-                                            "Expert controls are intended for CLI parity and transport debugging, not the normal Android flow."
+                                            "Expert controls are only for explicit trust overrides, TLS debugging, bandwidth caps, and QUIC tuning."
                                         }
-                                        FieldRow { label: "Salamander", placeholder: "Optional obfs password", value: form_snapshot.obfs_password.clone(), oninput: move |value| form.write().obfs_password = value }
-                                        FieldRow { label: "TLS SNI", placeholder: "Optional SNI override", value: form_snapshot.sni.clone(), oninput: move |value| form.write().sni = value }
+                                        FieldRow { label: "CA path", placeholder: "Optional PEM path inside app storage", value: form_snapshot.ca_path.clone(), oninput: move |value| form.write().ca_path = value }
+                                        CaSelector {
+                                            directory: ca_catalog_snapshot.directory.clone(),
+                                            files: ca_catalog_snapshot.files.clone(),
+                                            selected_path: form_snapshot.ca_path.clone(),
+                                            onselect: move |path: String| {
+                                                form.write().ca_path = path.clone();
+                                                if path.trim().is_empty() {
+                                                    append_log(&mut logs, "cleared CA path selection".to_string());
+                                                } else {
+                                                    append_log(&mut logs, format!("selected CA path: {path}"));
+                                                }
+                                            },
+                                            onrefresh: move |_| {
+                                                match android_bridge::query_ca_catalog() {
+                                                    Ok(catalog) => {
+                                                        let count = catalog.files.len();
+                                                        let directory = catalog.directory.clone();
+                                                        ca_catalog.set(catalog);
+                                                        if count == 0 {
+                                                            append_log(
+                                                                &mut logs,
+                                                                format!(
+                                                                    "no CA files found in {}",
+                                                                    config_value_or_empty(&directory)
+                                                                ),
+                                                            );
+                                                        } else {
+                                                            append_log(
+                                                                &mut logs,
+                                                                format!(
+                                                                    "refreshed CA catalog: {count} file(s) in {directory}"
+                                                                ),
+                                                            );
+                                                        }
+                                                    }
+                                                    Err(err) => append_log(
+                                                        &mut logs,
+                                                        format!("refresh CA catalog failed: {err:#}"),
+                                                    ),
+                                                }
+                                            }
+                                        }
                                         FieldRow { label: "pinSHA256", placeholder: "Optional certificate pin", value: form_snapshot.pin_sha256.clone(), oninput: move |value| form.write().pin_sha256 = value }
                                         FieldRow { label: "Bandwidth up", placeholder: "Optional, e.g. 100 Mbps", value: form_snapshot.bandwidth_up.clone(), oninput: move |value| form.write().bandwidth_up = value }
                                         FieldRow { label: "Bandwidth down", placeholder: "Optional, e.g. 500 Mbps", value: form_snapshot.bandwidth_down.clone(), oninput: move |value| form.write().bandwidth_down = value }
@@ -2273,19 +2314,19 @@ fn App() -> Element {
                                 div {
                                     style: "display: flex; gap: 12px; align-items: center; margin-top: 14px; flex-wrap: wrap;",
                                     button {
-                                        style: filter_chip_style(form_snapshot.insecure_tls),
-                                        onclick: move |_| {
-                                            let next = !form().insecure_tls;
-                                            form.write().insecure_tls = next;
-                                        },
-                                        if form_snapshot.insecure_tls { "TLS insecure: ON" } else { "TLS insecure: OFF" }
-                                    }
-                                    button {
                                         style: filter_chip_style(prefs_snapshot.show_advanced_fields),
                                         onclick: move |_| prefs.with_mut(|current| current.show_advanced_fields = !current.show_advanced_fields),
                                         if prefs_snapshot.show_advanced_fields { "Expert mode: On" } else { "Expert mode: Off" }
                                     }
                                     if prefs_snapshot.show_advanced_fields {
+                                        button {
+                                            style: filter_chip_style(form_snapshot.insecure_tls),
+                                            onclick: move |_| {
+                                                let next = !form().insecure_tls;
+                                                form.write().insecure_tls = next;
+                                            },
+                                            if form_snapshot.insecure_tls { "TLS insecure: ON" } else { "TLS insecure: OFF" }
+                                        }
                                         button {
                                             style: filter_chip_style(form_snapshot.quic_disable_path_mtu_discovery),
                                             onclick: move |_| {
@@ -2303,12 +2344,12 @@ fn App() -> Element {
                                 if !can_connect {
                                     p {
                                         style: "margin: 14px 0 0; color: #fca5a5; font-size: 13px;",
-                                        "Server and Auth must be set before Connect or Start System VPN can run."
+                                        "Server and Auth must be set before the Android connection flow can start."
                                     }
                                 } else if !prefs_snapshot.show_advanced_fields {
                                     p {
                                         style: "margin: 14px 0 0; color: #6e7b91; font-size: 12px; line-height: 1.5;",
-                                        "Normal mobile flow is ready. Leave Expert mode off unless you are testing obfs, pinning, bandwidth, or QUIC tuning."
+                                        "Normal mobile flow is ready. Leave Expert mode off unless you need explicit CA files, TLS insecure, pinning, bandwidth caps, or QUIC tuning."
                                     }
                                 }
                             }
@@ -2316,8 +2357,8 @@ fn App() -> Element {
                             section {
                                 style: panel_style(&prefs_snapshot),
                                 SectionHeader {
-                                    title: "Profile Actions",
-                                    subtitle: "Persist the draft locally or execute the connection workflow.".to_string(),
+                                    title: "Profile Storage",
+                                    subtitle: "Persist the draft locally. Connect and disconnect stay on Home so the main Android path only has one place to start.".to_string(),
                                 }
                                 div {
                                     style: "display: flex; gap: 12px; flex-wrap: wrap;",
@@ -2363,35 +2404,6 @@ fn App() -> Element {
                                                 append_log(&mut logs, "cleared saved profile".to_string());
                                             }
                                             Err(err) => append_log(&mut logs, format!("clear saved profile failed: {err:#}")),
-                                        },
-                                    }
-                                    PrimaryButton {
-                                        label: "Connect",
-                                        disabled: !can_connect,
-                                        secondary: false,
-                                        onclick: {
-                                            let controller = controller.clone();
-                                            let snapshot = form();
-                                            move |_| controller.send(AppCommand::Connect(snapshot.clone()))
-                                        },
-                                    }
-                                    PrimaryButton {
-                                        label: "Start System VPN",
-                                        disabled: !can_connect,
-                                        secondary: true,
-                                        onclick: {
-                                            let controller = controller.clone();
-                                            let snapshot = form();
-                                            move |_| controller.send(AppCommand::StartManagedVpn(snapshot.clone()))
-                                        },
-                                    }
-                                    PrimaryButton {
-                                        label: "Disconnect",
-                                        disabled: false,
-                                        secondary: true,
-                                        onclick: {
-                                            let controller = controller.clone();
-                                            move |_| controller.send(AppCommand::Disconnect)
                                         },
                                     }
                                 }
@@ -2550,24 +2562,24 @@ fn App() -> Element {
                                 style: panel_style(&prefs_snapshot),
                                 SectionHeader {
                                     title: "Connection Settings",
-                                    subtitle: "Only the mobile features that are complete enough to be part of the main path stay here.".to_string(),
+                                    subtitle: "The main path stays minimal. Expert transport and trust overrides live with the draft editor.".to_string(),
                                 }
                                 SettingRow {
-                                    label: "TLS insecure",
-                                    detail: (if form_snapshot.insecure_tls {
-                                        "Enabled for easier bring-up while CA or pinning is not ready."
+                                    label: "Expert controls",
+                                    detail: (if prefs_snapshot.show_advanced_fields {
+                                        "Expert controls are currently visible in Active Draft."
                                     } else {
-                                        "TLS verification is enabled."
+                                        "Expert controls are hidden. Open Active Draft to manage explicit CA, TLS insecure, pinning, bandwidth caps, and QUIC tuning."
                                     })
                                     .to_string(),
                                     control: rsx! {
                                         button {
-                                            style: filter_chip_style(form_snapshot.insecure_tls),
+                                            style: filter_chip_style(prefs_snapshot.show_advanced_fields),
                                             onclick: move |_| {
-                                                let next = !form().insecure_tls;
-                                                form.write().insecure_tls = next;
+                                                settings_return_tab.set(AppTab::Nodes);
+                                                active_tab.set(AppTab::Nodes);
                                             },
-                                            if form_snapshot.insecure_tls { "On" } else { "Off" }
+                                            if prefs_snapshot.show_advanced_fields { "Open" } else { "Manage" }
                                         }
                                     },
                                 }
@@ -3240,12 +3252,8 @@ async fn connect_client(form: FormState) -> Result<(Client, UiStatus)> {
     let normalized = normalize_form(form)?;
     let server_addr = resolve_socket_addr(&normalized.server)?;
     let server_name = infer_server_name(&normalized.server, &normalized.sni)?;
-    let root_certificates = load_optional_certificates(&normalized.ca_path)?;
+    let root_certificates = load_root_certificates(&normalized.ca_path)?;
     let pinned = parse_optional_pinned_sha256(&normalized.pin_sha256)?;
-
-    if !normalized.insecure_tls && root_certificates.is_empty() && pinned.is_none() {
-        bail!("set a CA path, pinSHA256, or enable TLS insecure for MVP bring-up");
-    }
 
     let mut config = CoreClientConfig::new(server_addr, server_name);
     config.auth = normalized.auth.clone();
@@ -3598,10 +3606,21 @@ fn normalize_server_addr(input: &str) -> Result<String> {
     Ok(format!("{input}:443"))
 }
 
-fn load_optional_certificates(path: &str) -> Result<Vec<CertificateDer<'static>>> {
+fn load_root_certificates(path: &str) -> Result<Vec<CertificateDer<'static>>> {
+    load_root_certificates_with(path, load_system_root_certificates)
+}
+
+fn load_root_certificates_with<F>(
+    path: &str,
+    system_loader: F,
+) -> Result<Vec<CertificateDer<'static>>>
+where
+    F: FnOnce() -> Result<Vec<CertificateDer<'static>>>,
+{
     if path.trim().is_empty() {
-        return Ok(Vec::new());
+        return system_loader();
     }
+
     let file = File::open(Path::new(path))
         .with_context(|| format!("failed to open certificate file {path}"))?;
     let mut reader = BufReader::new(file);
@@ -3611,6 +3630,27 @@ fn load_optional_certificates(path: &str) -> Result<Vec<CertificateDer<'static>>
         bail!("no certificates found in {path}");
     }
     Ok(certs.into_iter().map(CertificateDer::from).collect())
+}
+
+fn load_system_root_certificates() -> Result<Vec<CertificateDer<'static>>> {
+    let result = rustls_native_certs::load_native_certs();
+    if !result.certs.is_empty() {
+        return Ok(result.certs);
+    }
+
+    if result.errors.is_empty() {
+        bail!(
+            "no system root certificates found; set an explicit CA path or enable TLS insecure for testing"
+        );
+    }
+
+    let details = result
+        .errors
+        .into_iter()
+        .map(|err| err.to_string())
+        .collect::<Vec<_>>()
+        .join("; ");
+    bail!("failed to load system root certificates: {details}");
 }
 
 fn parse_optional_pinned_sha256(input: &str) -> Result<Option<[u8; 32]>> {
