@@ -90,6 +90,16 @@ pub fn build_runnable_client_config(config: &ClientConfig) -> Result<RunnableCli
 }
 
 pub fn build_client_core_config(config: &ClientConfig) -> Result<core::ClientConfig> {
+    build_client_core_config_with(config, load_system_root_certificates)
+}
+
+fn build_client_core_config_with<F>(
+    config: &ClientConfig,
+    system_loader: F,
+) -> Result<core::ClientConfig>
+where
+    F: FnOnce() -> Result<Vec<CertificateDer<'static>>>,
+{
     let config = normalize_client_config(config)?;
     ensure_client_core_supported(&config)?;
 
@@ -106,15 +116,10 @@ pub fn build_client_core_config(config: &ClientConfig) -> Result<core::ClientCon
     core_config.quic = build_client_quic_transport(&config.quic).context("invalid quic config")?;
     core_config.tls = core::ClientTlsConfig {
         insecure: config.tls.insecure,
-        root_certificates: load_optional_certificates(&config.tls.ca)
-            .context("failed to load tls.ca")?,
+        root_certificates: load_root_certificates_with(&config.tls.ca, system_loader)?,
         pinned_certificate_sha256: parse_optional_pinned_sha256(&config.tls.pin_sha256)
             .context("invalid tls.pinSHA256")?,
     };
-
-    if !core_config.tls.insecure && core_config.tls.root_certificates.is_empty() {
-        bail!("tls.ca is required for the Rust client unless tls.insecure=true");
-    }
 
     Ok(core_config)
 }
@@ -628,6 +633,43 @@ fn load_optional_certificates(path: &str) -> Result<Vec<CertificateDer<'static>>
         return Ok(Vec::new());
     }
     load_certificates(Path::new(path))
+}
+
+fn load_root_certificates(path: &str) -> Result<Vec<CertificateDer<'static>>> {
+    load_root_certificates_with(path, load_system_root_certificates)
+}
+
+fn load_root_certificates_with<F>(
+    path: &str,
+    system_loader: F,
+) -> Result<Vec<CertificateDer<'static>>>
+where
+    F: FnOnce() -> Result<Vec<CertificateDer<'static>>>,
+{
+    if path.trim().is_empty() {
+        return system_loader();
+    }
+
+    load_certificates(Path::new(path)).context("failed to load tls.ca")
+}
+
+fn load_system_root_certificates() -> Result<Vec<CertificateDer<'static>>> {
+    let result = rustls_native_certs::load_native_certs();
+    if !result.certs.is_empty() {
+        return Ok(result.certs);
+    }
+
+    if result.errors.is_empty() {
+        bail!("no system root certificates found; set tls.ca explicitly or use tls.insecure=true");
+    }
+
+    let details = result
+        .errors
+        .into_iter()
+        .map(|err| err.to_string())
+        .collect::<Vec<_>>()
+        .join("; ");
+    bail!("failed to load system root certificates: {details}");
 }
 
 fn load_certificates(path: &Path) -> Result<Vec<CertificateDer<'static>>> {
@@ -1348,6 +1390,43 @@ mod tests {
             runtime.quic.max_idle_timeout,
             core::DEFAULT_MAX_IDLE_TIMEOUT
         );
+    }
+
+    #[test]
+    fn build_client_core_config_uses_system_roots_when_ca_missing() {
+        let config = ClientConfig {
+            server: "127.0.0.1:443".into(),
+            tls: ClientTlsConfig {
+                sni: "example.com".into(),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        let runtime = build_client_core_config_with(&config, || {
+            Ok(vec![CertificateDer::from(vec![1_u8, 2, 3])])
+        })
+        .unwrap();
+
+        assert_eq!(runtime.server_addr, "127.0.0.1:443".parse().unwrap());
+        assert_eq!(runtime.server_name, "example.com");
+        assert_eq!(runtime.tls.root_certificates.len(), 1);
+    }
+
+    #[test]
+    fn load_root_certificates_prefers_explicit_ca_over_system_store() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let cert_path = tempdir.path().join("bad-cert.pem");
+        fs::write(&cert_path, "not a certificate").unwrap();
+
+        let err = load_root_certificates_with(cert_path.to_str().unwrap(), || {
+            bail!("system loader should not be called");
+        })
+        .unwrap_err()
+        .to_string();
+
+        assert!(err.contains("failed to load tls.ca"));
+        assert!(!err.contains("system loader should not be called"));
     }
 
     #[test]
