@@ -9,3 +9,9 @@
 - `app`：CLI 骨架
 
 目标是按 Go 版的 `app / core / extras` 模块边界逐步做行为兼容复刻。
+
+## 吞吐记录
+
+已将当前高时延高丢包链路下的吞吐记录整理到：
+
+- `docs/throughput.md`

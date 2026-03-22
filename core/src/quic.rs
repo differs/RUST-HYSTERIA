@@ -1,18 +1,14 @@
 use std::{
-    any::Any,
     convert::TryInto,
-    sync::{
-        Arc,
-        atomic::{AtomicU64, Ordering},
-    },
-    time::{Duration, Instant},
+    env,
+    sync::{Arc, atomic::AtomicU64},
+    time::Duration,
 };
 
 use quinn::{
-    IdleTimeout, TransportConfig, VarInt,
-    congestion::{BbrConfig, Controller, ControllerFactory},
+    AckFrequencyConfig, IdleTimeout, TransportConfig, VarInt,
+    congestion::{BbrConfig, BrutalConfig},
 };
-use quinn_proto::RttEstimator;
 
 use crate::{CoreError, CoreResult};
 
@@ -22,10 +18,6 @@ pub const DEFAULT_MAX_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 pub const DEFAULT_KEEP_ALIVE_PERIOD: Duration = Duration::from_secs(10);
 pub const DEFAULT_MAX_INCOMING_STREAMS: u64 = 1024;
 const MIN_QUIC_RECEIVE_WINDOW: u64 = 16 * 1024;
-const BRUTAL_SLOT_COUNT: usize = 5;
-const BRUTAL_MIN_SAMPLE_COUNT: u64 = 50;
-const BRUTAL_MIN_ACK_RATE: f64 = 0.8;
-const BRUTAL_CONGESTION_WINDOW_MULTIPLIER: f64 = 2.0;
 
 #[derive(Debug, Clone)]
 pub struct QuicTransportConfig {
@@ -94,13 +86,25 @@ pub(crate) fn build_transport_config(
                 .receive_window
                 .max(config.stream_receive_window.saturating_mul(8)),
         )
+        .ack_frequency_config(ack_frequency_override())
         .initial_rtt(Duration::from_millis(250))
         .persistent_congestion_threshold(5)
         .max_idle_timeout(Some(idle_timeout(config.max_idle_timeout)?))
         .keep_alive_interval(config.keep_alive_interval)
-        .congestion_controller_factory(Arc::new(BandwidthAwareControllerFactory::new(
-            bandwidth_target,
-        )));
+        .congestion_controller_factory(Arc::new(build_brutal_config(bandwidth_target)));
+
+    if let Some(value) = env_u64("HY_RS_PACKET_THRESHOLD") {
+        transport.packet_threshold(value.clamp(3, u32::MAX as u64) as u32);
+    }
+    if let Some(value) = env_f32("HY_RS_TIME_THRESHOLD") {
+        transport.time_threshold(value.max(1.0));
+    }
+    if let Some(value) = env_u64("HY_RS_PERSISTENT_CONGESTION_THRESHOLD") {
+        transport.persistent_congestion_threshold(value.clamp(1, u32::MAX as u64) as u32);
+    }
+    if let Some(value) = env_bool("HY_RS_DISABLE_GSO") {
+        transport.enable_segmentation_offload(!value);
+    }
 
     if let Some(max_concurrent_bidi_streams) = config.max_concurrent_bidi_streams {
         transport.max_concurrent_bidi_streams(varint(
@@ -126,217 +130,63 @@ fn idle_timeout(value: Duration) -> CoreResult<IdleTimeout> {
         .map_err(|_| CoreError::Config("quic.max_idle_timeout is too large".into()))
 }
 
-#[derive(Debug, Clone)]
-struct BandwidthAwareControllerFactory {
-    bandwidth_target: Arc<AtomicU64>,
-    fallback: BbrConfig,
+fn ack_frequency_override() -> Option<AckFrequencyConfig> {
+    if !env_bool("HY_RS_ACK_ENABLE").unwrap_or(false) {
+        return None;
+    }
+
+    let mut config = AckFrequencyConfig::default();
+    if let Some(value) = env_u64("HY_RS_ACK_THRESH") {
+        config.ack_eliciting_threshold(VarInt::from_u32(value.min(u32::MAX as u64) as u32));
+    }
+    if let Some(value) = env_u64("HY_RS_ACK_MAX_DELAY_MS") {
+        config.max_ack_delay(Some(Duration::from_millis(value)));
+    }
+    if let Some(value) = env_u64("HY_RS_ACK_REORDER_THRESHOLD") {
+        config.reordering_threshold(VarInt::from_u32(value.min(u32::MAX as u64) as u32));
+    }
+    Some(config)
 }
 
-impl BandwidthAwareControllerFactory {
-    fn new(bandwidth_target: Arc<AtomicU64>) -> Self {
-        Self {
-            bandwidth_target,
-            fallback: BbrConfig::default(),
-        }
-    }
+fn build_brutal_config(bandwidth_target: Arc<AtomicU64>) -> BrutalConfig {
+    let mut fallback = BbrConfig::default();
+    let initial_window = env_u64("HY_RS_BBR_INITIAL_WINDOW")
+        .or_else(|| env_u64("HY_RS_BBR_INITIAL_WINDOW_PKTS").map(|value| value * 1200))
+        .unwrap_or(512 * 1200);
+    fallback
+        .initial_window(initial_window)
+        .startup_growth_target(env_f32("HY_RS_BBR_STARTUP_GROWTH").unwrap_or(1.25))
+        .startup_rounds_without_growth_before_exit(
+            env_u64("HY_RS_BBR_STARTUP_ROUNDS")
+                .unwrap_or(6)
+                .clamp(1, u8::MAX as u64) as u8,
+        )
+        .exit_startup_on_recovery(env_bool("HY_RS_BBR_EXIT_ON_RECOVERY").unwrap_or(false))
+        .recover_on_non_persistent_loss(
+            env_bool("HY_RS_BBR_RECOVER_NON_PERSISTENT").unwrap_or(false),
+        )
+        .non_persistent_loss_reduction_factor(
+            env_f32("HY_RS_BBR_NON_PERSISTENT_LOSS_FACTOR").unwrap_or(0.25),
+        );
+
+    let mut brutal = BrutalConfig::new(bandwidth_target);
+    brutal.fallback_config(fallback);
+    brutal
 }
 
-impl ControllerFactory for BandwidthAwareControllerFactory {
-    fn build(self: Arc<Self>, now: Instant, current_mtu: u16) -> Box<dyn Controller> {
-        Box::new(BandwidthAwareController {
-            bandwidth_target: self.bandwidth_target.clone(),
-            fallback: Arc::new(self.fallback.clone()).build(now, current_mtu),
-            current_mtu,
-            smoothed_rtt: Duration::from_millis(333),
-            sample_epoch: now,
-            packet_samples: [PacketSample::default(); BRUTAL_SLOT_COUNT],
-            ack_rate: 1.0,
-        })
-    }
+fn env_u64(name: &str) -> Option<u64> {
+    env::var(name).ok()?.parse().ok()
 }
 
-struct BandwidthAwareController {
-    bandwidth_target: Arc<AtomicU64>,
-    fallback: Box<dyn Controller>,
-    current_mtu: u16,
-    smoothed_rtt: Duration,
-    sample_epoch: Instant,
-    packet_samples: [PacketSample; BRUTAL_SLOT_COUNT],
-    ack_rate: f64,
+fn env_f32(name: &str) -> Option<f32> {
+    env::var(name).ok()?.parse().ok()
 }
 
-impl BandwidthAwareController {
-    fn brutal_window(&self, target_bytes_per_sec: u64) -> u64 {
-        let rtt = if self.smoothed_rtt.is_zero() {
-            Duration::from_millis(333)
-        } else {
-            self.smoothed_rtt
-        };
-        let cwnd =
-            (target_bytes_per_sec as f64 * rtt.as_secs_f64() * BRUTAL_CONGESTION_WINDOW_MULTIPLIER
-                / self.ack_rate.max(BRUTAL_MIN_ACK_RATE)) as u64;
-        cwnd.max(self.fallback.initial_window())
-            .max(self.current_mtu as u64)
-    }
-
-    fn using_fallback(&self) -> bool {
-        self.bandwidth_target.load(Ordering::Relaxed) == 0
-    }
-
-    fn record_ack(&mut self, now: Instant) {
-        self.record_samples(now, 1, 0);
-    }
-
-    fn record_loss(&mut self, now: Instant, lost_bytes: u64) {
-        let packets = lost_bytes
-            .max(self.current_mtu as u64)
-            .div_ceil(self.current_mtu.max(1) as u64)
-            .max(1);
-        self.record_samples(now, 0, packets);
-    }
-
-    fn record_samples(&mut self, now: Instant, acked_packets: u64, lost_packets: u64) {
-        let current_second = now.saturating_duration_since(self.sample_epoch).as_secs();
-        let slot = (current_second as usize) % BRUTAL_SLOT_COUNT;
-        let sample = &mut self.packet_samples[slot];
-        if sample.second == current_second {
-            sample.acked_packets = sample.acked_packets.saturating_add(acked_packets);
-            sample.lost_packets = sample.lost_packets.saturating_add(lost_packets);
-        } else {
-            *sample = PacketSample {
-                second: current_second,
-                acked_packets,
-                lost_packets,
-            };
-        }
-        self.ack_rate = self.calculate_ack_rate(current_second);
-    }
-
-    fn calculate_ack_rate(&self, current_second: u64) -> f64 {
-        let min_second = current_second.saturating_sub(BRUTAL_SLOT_COUNT as u64);
-        let (acked_packets, lost_packets) = self
-            .packet_samples
-            .iter()
-            .filter(|sample| sample.second >= min_second)
-            .fold((0_u64, 0_u64), |(acked, lost), sample| {
-                (
-                    acked.saturating_add(sample.acked_packets),
-                    lost.saturating_add(sample.lost_packets),
-                )
-            });
-        let total_packets = acked_packets.saturating_add(lost_packets);
-        if total_packets < BRUTAL_MIN_SAMPLE_COUNT {
-            1.0
-        } else {
-            (acked_packets as f64 / total_packets as f64).max(BRUTAL_MIN_ACK_RATE)
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug, Default)]
-struct PacketSample {
-    second: u64,
-    acked_packets: u64,
-    lost_packets: u64,
-}
-
-impl Controller for BandwidthAwareController {
-    fn on_sent(&mut self, now: Instant, bytes: u64, last_packet_number: u64) {
-        if self.using_fallback() {
-            self.fallback.on_sent(now, bytes, last_packet_number);
-        }
-    }
-
-    fn on_ack(
-        &mut self,
-        now: Instant,
-        sent: Instant,
-        bytes: u64,
-        app_limited: bool,
-        rtt: &RttEstimator,
-    ) {
-        self.smoothed_rtt = rtt.get();
-        if self.using_fallback() {
-            self.fallback.on_ack(now, sent, bytes, app_limited, rtt);
-        } else {
-            self.record_ack(now);
-        }
-    }
-
-    fn on_end_acks(
-        &mut self,
-        now: Instant,
-        in_flight: u64,
-        app_limited: bool,
-        largest_packet_num_acked: Option<u64>,
-    ) {
-        if self.using_fallback() {
-            self.fallback
-                .on_end_acks(now, in_flight, app_limited, largest_packet_num_acked);
-        }
-    }
-
-    fn on_congestion_event(
-        &mut self,
-        now: Instant,
-        sent: Instant,
-        is_persistent_congestion: bool,
-        lost_bytes: u64,
-    ) {
-        if self.using_fallback() {
-            self.fallback
-                .on_congestion_event(now, sent, is_persistent_congestion, lost_bytes);
-        } else {
-            self.record_loss(now, lost_bytes);
-        }
-    }
-
-    fn on_mtu_update(&mut self, new_mtu: u16) {
-        self.current_mtu = new_mtu;
-        self.fallback.on_mtu_update(new_mtu);
-    }
-
-    fn window(&self) -> u64 {
-        let target_bytes_per_sec = self.bandwidth_target.load(Ordering::Relaxed);
-        if target_bytes_per_sec == 0 {
-            self.fallback.window()
-        } else {
-            self.brutal_window(target_bytes_per_sec)
-        }
-    }
-
-    fn metrics(&self) -> quinn::congestion::ControllerMetrics {
-        if self.using_fallback() {
-            self.fallback.metrics()
-        } else {
-            let mut metrics = quinn::congestion::ControllerMetrics::default();
-            metrics.congestion_window = self.window();
-            metrics
-        }
-    }
-
-    fn clone_box(&self) -> Box<dyn Controller> {
-        Box::new(Self {
-            bandwidth_target: self.bandwidth_target.clone(),
-            fallback: self.fallback.clone_box(),
-            current_mtu: self.current_mtu,
-            smoothed_rtt: self.smoothed_rtt,
-            sample_epoch: self.sample_epoch,
-            packet_samples: self.packet_samples,
-            ack_rate: self.ack_rate,
-        })
-    }
-
-    fn initial_window(&self) -> u64 {
-        let target_bytes_per_sec = self.bandwidth_target.load(Ordering::Relaxed);
-        if target_bytes_per_sec == 0 {
-            self.fallback.initial_window()
-        } else {
-            self.brutal_window(target_bytes_per_sec)
-        }
-    }
-
-    fn into_any(self: Box<Self>) -> Box<dyn Any> {
-        self
+fn env_bool(name: &str) -> Option<bool> {
+    let value = env::var(name).ok()?;
+    match value.trim().to_ascii_lowercase().as_str() {
+        "1" | "true" | "yes" | "on" => Some(true),
+        "0" | "false" | "no" | "off" => Some(false),
+        _ => None,
     }
 }
