@@ -5,6 +5,9 @@ use std::{
     task::{Context, Poll},
 };
 
+#[cfg(target_os = "android")]
+use std::os::fd::AsRawFd;
+
 use hysteria_extras::obfs::{Obfuscator, SALAMANDER_SALT_LEN, SalamanderObfuscator};
 use quinn::{
     AsyncUdpSocket, Endpoint, EndpointConfig, Runtime, ServerConfig as QuinnServerConfig,
@@ -26,7 +29,31 @@ pub(crate) fn make_client_endpoint(
     bind_addr: SocketAddr,
     obfs: Option<&ObfsConfig>,
 ) -> CoreResult<Endpoint> {
-    make_endpoint(bind_addr, None, obfs)
+    let socket = std::net::UdpSocket::bind(bind_addr)?;
+    configure_udp_socket(&socket);
+    #[cfg(target_os = "android")]
+    maybe_protect_android_vpn_socket(&socket);
+    socket.set_nonblocking(true)?;
+
+    let runtime: Arc<dyn Runtime> = Arc::new(TokioRuntime);
+    if let Some(obfs) = obfs {
+        let inner = runtime.wrap_udp_socket(socket)?;
+        let wrapped: Arc<dyn AsyncUdpSocket> =
+            Arc::new(ObfsUdpSocket::new(inner, build_obfuscator(obfs)?));
+        Ok(Endpoint::new_with_abstract_socket(
+            EndpointConfig::default(),
+            None,
+            wrapped,
+            runtime,
+        )?)
+    } else {
+        Ok(Endpoint::new(
+            EndpointConfig::default(),
+            None,
+            socket,
+            runtime,
+        )?)
+    }
 }
 
 pub(crate) fn make_server_endpoint(
@@ -71,6 +98,11 @@ fn configure_udp_socket(socket: &std::net::UdpSocket) {
     let sock_ref = SockRef::from(socket);
     let _ = sock_ref.set_recv_buffer_size(DEFAULT_UDP_SOCKET_BUFFER_SIZE);
     let _ = sock_ref.set_send_buffer_size(DEFAULT_UDP_SOCKET_BUFFER_SIZE);
+}
+
+#[cfg(target_os = "android")]
+fn maybe_protect_android_vpn_socket(socket: &std::net::UdpSocket) {
+    crate::android::maybe_protect_socket(socket.as_raw_fd());
 }
 
 fn build_obfuscator(config: &ObfsConfig) -> CoreResult<Arc<SalamanderObfuscator>> {

@@ -1,0 +1,30 @@
+[package]
+name = "hysteria-mobile"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1.0"
+futures-timer = "3.0"
+humantime = "2.3"
+humantime-serde = "1.1"
+hysteria-core = { path = "../core" }
+hysteria-extras = { path = "../extras" }
+rustls = { workspace = true }
+rustls-pemfile = "1.0.4"
+serde = { version = "1.0", features = ["derive"] }
+serde_yaml = "0.9"
+tokio = { workspace = true, features = ["io-util", "macros", "net", "rt", "rt-multi-thread", "sync", "time"] }
+url = "2.5"
+
+[target.'cfg(target_os = "android")'.dependencies]
+jni = "0.22.4"
+ndk-context = "0.1.1"
+tun2socks = { path = "vendor/tun2socks" }
+
+
+[target.'cfg(any(target_os = "android", target_os = "ios"))'.dependencies]
+dioxus = { version = "0.7.3", default-features = false, features = ["hooks", "html", "launch", "logger", "macro", "signals", "mobile"] }
+
+[target.'cfg(not(any(target_os = "android", target_os = "ios")))'.dependencies]
+dioxus = { version = "0.7.3", default-features = false, features = ["hooks", "html", "launch", "logger", "macro", "signals", "desktop"] }

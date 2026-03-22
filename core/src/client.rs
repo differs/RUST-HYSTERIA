@@ -201,6 +201,10 @@ impl Client {
         self.connection.remote_address()
     }
 
+    pub async fn wait_closed(&self) -> CoreError {
+        CoreError::Closed(self.connection.closed().await.to_string())
+    }
+
     pub async fn close(&self) -> CoreResult<()> {
         self.connection
             .close(VarInt::from_u32(CLOSE_ERR_CODE_OK), b"");

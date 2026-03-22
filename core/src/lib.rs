@@ -1,5 +1,7 @@
 #![forbid(unsafe_code)]
 
+#[cfg(target_os = "android")]
+pub mod android;
 pub mod client;
 pub mod errors;
 pub mod frag;

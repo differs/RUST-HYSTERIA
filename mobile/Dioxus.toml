@@ -1,0 +1,14 @@
+[application]
+name = "Hysteria Android"
+default_platform = "android"
+out_dir = "dist"
+asset_dir = "assets"
+android_manifest = "android/AndroidManifest.xml"
+android_main_activity = "android/MainActivity.kt"
+android_min_sdk_version = 28
+
+[bundle]
+identifier = "io.hysteria.mobile"
+publisher = "Hysteria"
+short_description = "Hysteria Android client built with Dioxus 0.7"
+long_description = "A native Android client shell for Hysteria built on Dioxus 0.7 and hysteria-core."
