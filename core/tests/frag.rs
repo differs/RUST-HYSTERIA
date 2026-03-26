@@ -59,3 +59,31 @@ fn defragger_rejects_invalid_fragment_id() {
     let mut defragger = Defragger::default();
     assert!(defragger.feed(message).is_none());
 }
+
+#[test]
+fn defragger_handles_interleaved_packets() {
+    let mut first = sample_message(64);
+    first.packet_id = 100;
+    let mut second = sample_message(64);
+    second.packet_id = 200;
+    second.addr = "example.net:443".into();
+
+    let first_fragments = frag_udp_message(&first, first.header_size() + 20);
+    let second_fragments = frag_udp_message(&second, second.header_size() + 20);
+
+    let mut defragger = Defragger::default();
+    assert!(defragger.feed(first_fragments[0].clone()).is_none());
+    assert!(defragger.feed(second_fragments[0].clone()).is_none());
+    assert!(defragger.feed(first_fragments[1].clone()).is_none());
+    assert!(defragger.feed(second_fragments[1].clone()).is_none());
+    assert!(defragger.feed(first_fragments[2].clone()).is_none());
+    assert!(defragger.feed(second_fragments[2].clone()).is_none());
+
+    let rebuilt_first = defragger.feed(first_fragments[3].clone()).unwrap();
+    let rebuilt_second = defragger.feed(second_fragments[3].clone()).unwrap();
+
+    assert_eq!(rebuilt_first.addr, first.addr);
+    assert_eq!(rebuilt_first.data, first.data);
+    assert_eq!(rebuilt_second.addr, second.addr);
+    assert_eq!(rebuilt_second.data, second.data);
+}

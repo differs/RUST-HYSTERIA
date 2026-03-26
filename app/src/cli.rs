@@ -106,6 +106,7 @@ pub enum Command {
     Ping(PingArgs),
     Share(ShareArgs),
     Speedtest(SpeedtestArgs),
+    UdpBench(UdpBenchArgs),
     #[command(alias = "check-update")]
     Update,
 }
@@ -134,6 +135,10 @@ pub struct ShareArgs {
     pub no_text: bool,
     #[arg(long)]
     pub qr: bool,
+    #[arg(long = "yaml")]
+    pub yaml: bool,
+    #[arg(long = "yaml-only")]
+    pub yaml_only: bool,
 }
 
 #[derive(Debug, Clone, Args)]
@@ -148,6 +153,45 @@ pub struct SpeedtestArgs {
     pub data_size: Option<u32>,
     #[arg(long = "use-bytes")]
     pub use_bytes: bool,
+}
+
+#[derive(Debug, Clone, Args)]
+pub struct UdpBenchArgs {
+    #[command(subcommand)]
+    pub command: UdpBenchCommand,
+}
+
+#[derive(Debug, Clone, Subcommand)]
+pub enum UdpBenchCommand {
+    Echo(UdpBenchEchoArgs),
+    Run(UdpBenchRunArgs),
+}
+
+#[derive(Debug, Clone, Args)]
+pub struct UdpBenchEchoArgs {
+    #[arg(long = "listen", default_value = "127.0.0.1:9999")]
+    pub listen: String,
+    #[arg(long = "workers", default_value_t = 4)]
+    pub workers: usize,
+}
+
+#[derive(Debug, Clone, Args)]
+pub struct UdpBenchRunArgs {
+    pub target: String,
+    #[arg(long = "listen")]
+    pub listen: Option<String>,
+    #[arg(long = "packets", default_value_t = 10_000)]
+    pub packets: u32,
+    #[arg(long = "packet-size", default_value_t = 1400)]
+    pub packet_size: usize,
+    #[arg(long = "wg-mtu-sweep")]
+    pub wg_mtu_sweep: bool,
+    #[arg(long = "target-mbps", default_value_t = 0.0)]
+    pub target_mbps: f64,
+    #[arg(long = "window", default_value_t = 256)]
+    pub window: usize,
+    #[arg(long = "tail-timeout", default_value = "3s", value_parser = parse_duration)]
+    pub tail_timeout: Duration,
 }
 
 #[derive(Debug, Copy, Clone, Eq, PartialEq, ValueEnum)]
@@ -211,5 +255,17 @@ mod tests {
     fn defaults_to_no_subcommand() {
         let cli = Cli::parse_from(["hysteria"]);
         assert!(cli.command.is_none());
+    }
+
+    #[test]
+    fn parses_share_yaml_only_flag() {
+        let cli = Cli::parse_from(["hysteria", "share", "--yaml-only"]);
+        match cli.command {
+            Some(Command::Share(args)) => {
+                assert!(args.yaml_only);
+                assert!(!args.yaml);
+            }
+            other => panic!("expected share command, got {other:?}"),
+        }
     }
 }

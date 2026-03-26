@@ -24,6 +24,7 @@ rustls-native-certs = "=0.8.3"
 rustls-pemfile.workspace = true
 serde = { version = "1.0", features = ["derive"] }
 serde_yaml = "0.9"
+socket2.workspace = true
 tokio = { workspace = true, features = ["signal"] }
 url = "2.5"
 

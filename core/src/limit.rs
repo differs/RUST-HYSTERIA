@@ -26,6 +26,15 @@ pub(crate) enum LimitDecision {
     Wait(Duration),
 }
 
+pub(crate) fn negotiated_limit(local_limit: u64, remote_limit: u64) -> u64 {
+    match (local_limit, remote_limit) {
+        (0, 0) => 0,
+        (0, remote_limit) => remote_limit,
+        (local_limit, 0) => local_limit,
+        (local_limit, remote_limit) => local_limit.min(remote_limit),
+    }
+}
+
 impl BandwidthLimiter {
     pub(crate) fn optional(rate_bytes_per_sec: u64) -> Option<Arc<Self>> {
         (rate_bytes_per_sec > 0).then(|| Arc::new(Self::new(rate_bytes_per_sec)))
@@ -109,5 +118,19 @@ impl BandwidthLimiter {
     fn wait_duration(&self, missing_bytes: f64) -> Duration {
         let seconds = missing_bytes.max(1.0) / self.rate_bytes_per_sec.max(1) as f64;
         Duration::from_secs_f64(seconds)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::negotiated_limit;
+
+    #[test]
+    fn negotiated_limit_handles_unbounded_and_bounded_peers() {
+        assert_eq!(negotiated_limit(0, 0), 0);
+        assert_eq!(negotiated_limit(0, 1_000), 1_000);
+        assert_eq!(negotiated_limit(1_000, 0), 1_000);
+        assert_eq!(negotiated_limit(1_000, 2_000), 1_000);
+        assert_eq!(negotiated_limit(2_000, 1_000), 1_000);
     }
 }

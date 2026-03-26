@@ -1740,6 +1740,7 @@ dependencies = [
  "rustls-pemfile",
  "serde",
  "serde_yaml",
+ "socket2 0.5.10",
  "tempfile",
  "tokio",
  "url",

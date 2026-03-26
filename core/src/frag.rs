@@ -1,4 +1,8 @@
+use std::collections::{HashMap, VecDeque};
+
 use crate::protocol::UDPMessage;
+
+const MAX_IN_FLIGHT_PACKETS: usize = 64;
 
 pub fn frag_udp_message(message: &UDPMessage, max_size: usize) -> Vec<UDPMessage> {
     if message.size() <= max_size {
@@ -28,7 +32,14 @@ pub fn frag_udp_message(message: &UDPMessage, max_size: usize) -> Vec<UDPMessage
 
 #[derive(Debug, Default, Clone)]
 pub struct Defragger {
-    packet_id: u16,
+    packets: HashMap<u16, PacketState>,
+    order: VecDeque<u16>,
+}
+
+#[derive(Debug, Clone)]
+struct PacketState {
+    session_id: u32,
+    addr: String,
     fragments: Vec<Option<UDPMessage>>,
     count: u8,
     size: usize,
@@ -43,34 +54,75 @@ impl Defragger {
             return None;
         }
 
-        if message.packet_id != self.packet_id
-            || message.frag_count as usize != self.fragments.len()
-        {
-            self.packet_id = message.packet_id;
-            self.fragments = vec![None; message.frag_count as usize];
-            self.fragments[message.frag_id as usize] = Some(message.clone());
-            self.count = 1;
-            self.size = message.data.len();
+        let packet_id = message.packet_id;
+        let frag_index = message.frag_id as usize;
+        let frag_count = message.frag_count as usize;
+
+        let reset_packet = self
+            .packets
+            .get(&packet_id)
+            .map(|state| {
+                state.session_id != message.session_id
+                    || state.addr != message.addr
+                    || state.fragments.len() != frag_count
+            })
+            .unwrap_or(true);
+
+        if reset_packet {
+            self.insert_packet(packet_id, frag_count, &message);
             return None;
         }
 
-        if self.fragments[message.frag_id as usize].is_none() {
-            self.size += message.data.len();
-            self.count += 1;
-            self.fragments[message.frag_id as usize] = Some(message.clone());
-            if self.count as usize == self.fragments.len() {
+        if let Some(state) = self.packets.get_mut(&packet_id) {
+            if state.fragments[frag_index].is_none() {
+                state.size += message.data.len();
+                state.count += 1;
+                state.fragments[frag_index] = Some(message.clone());
+            }
+            if state.count as usize == state.fragments.len() {
                 let mut assembled = message;
-                let mut data = Vec::with_capacity(self.size);
-                for fragment in &self.fragments {
+                let mut data = Vec::with_capacity(state.size);
+                for fragment in &state.fragments {
                     data.extend_from_slice(&fragment.as_ref().expect("fragment must exist").data);
                 }
                 assembled.data = data;
                 assembled.frag_id = 0;
                 assembled.frag_count = 1;
+                self.remove_packet(packet_id);
                 return Some(assembled);
             }
         }
 
         None
+    }
+
+    fn insert_packet(&mut self, packet_id: u16, frag_count: usize, message: &UDPMessage) {
+        self.remove_packet(packet_id);
+        while self.order.len() >= MAX_IN_FLIGHT_PACKETS {
+            if let Some(oldest) = self.order.pop_front() {
+                self.packets.remove(&oldest);
+            }
+        }
+
+        let mut fragments = vec![None; frag_count];
+        fragments[message.frag_id as usize] = Some(message.clone());
+        self.packets.insert(
+            packet_id,
+            PacketState {
+                session_id: message.session_id,
+                addr: message.addr.clone(),
+                fragments,
+                count: 1,
+                size: message.data.len(),
+            },
+        );
+        self.order.push_back(packet_id);
+    }
+
+    fn remove_packet(&mut self, packet_id: u16) {
+        self.packets.remove(&packet_id);
+        if let Some(index) = self.order.iter().position(|id| *id == packet_id) {
+            self.order.remove(index);
+        }
     }
 }

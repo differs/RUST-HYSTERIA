@@ -13,7 +13,12 @@ use hysteria_core as core;
 use rustls::pki_types::{
     CertificateDer, PrivateKeyDer, PrivatePkcs1KeyDer, PrivatePkcs8KeyDer, PrivateSec1KeyDer,
 };
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
+
+const WIREGUARD_FORWARD_DEFAULT_TIMEOUT: Duration = Duration::from_secs(300);
+const WIREGUARD_FORWARD_DEFAULT_SOCKET_BUFFER: usize = 8 * 1024 * 1024;
+const WIREGUARD_FORWARD_DEFAULT_CHANNEL_DEPTH: usize = 4096;
+const WIREGUARD_FORWARD_DEFAULT_MTU: u32 = 1280;
 
 #[derive(Debug, Clone)]
 pub struct LoadedConfig<T> {
@@ -79,13 +84,14 @@ pub fn resolve_config_path(config_path: Option<&Path>) -> Result<PathBuf> {
 pub fn build_runnable_client_config(config: &ClientConfig) -> Result<RunnableClientConfig> {
     ensure_client_runtime_mode_supported(config)?;
     let core_config = build_client_core_config(config)?;
+    let udp_forwarding = merged_udp_forwarding_entries(config);
 
     Ok(RunnableClientConfig {
         core: core_config,
         socks5: config.socks5.clone(),
         http: config.http.clone(),
         tcp_forwarding: config.tcp_forwarding.clone(),
-        udp_forwarding: config.udp_forwarding.clone(),
+        udp_forwarding,
     })
 }
 
@@ -280,13 +286,16 @@ fn ensure_client_core_supported(config: &ClientConfig) -> Result<()> {
 
 fn ensure_client_runtime_mode_supported(config: &ClientConfig) -> Result<()> {
     ensure_client_core_supported(config)?;
+    let udp_forwarding = merged_udp_forwarding_entries(config);
 
     if config.socks5.is_none()
         && config.http.is_none()
         && config.tcp_forwarding.is_empty()
-        && config.udp_forwarding.is_empty()
+        && udp_forwarding.is_empty()
     {
-        bail!("no client mode specified; configure socks5, http, tcpForwarding, or udpForwarding");
+        bail!(
+            "no client mode specified; configure socks5, http, tcpForwarding, udpForwarding, or wireguardForwarding"
+        );
     }
     for (index, entry) in config.tcp_forwarding.iter().enumerate() {
         if entry.listen.trim().is_empty() {
@@ -296,15 +305,27 @@ fn ensure_client_runtime_mode_supported(config: &ClientConfig) -> Result<()> {
             bail!("tcpForwarding[{index}].remote must not be empty");
         }
     }
-    for (index, entry) in config.udp_forwarding.iter().enumerate() {
+    for (index, entry) in udp_forwarding.iter().enumerate() {
         if entry.listen.trim().is_empty() {
-            bail!("udpForwarding[{index}].listen must not be empty");
+            bail!("udp forwarding entry [{index}].listen must not be empty");
         }
         if entry.remote.trim().is_empty() {
-            bail!("udpForwarding[{index}].remote must not be empty");
+            bail!("udp forwarding entry [{index}].remote must not be empty");
         }
     }
     Ok(())
+}
+
+fn merged_udp_forwarding_entries(config: &ClientConfig) -> Vec<UdpForwardingEntry> {
+    let mut entries = config.udp_forwarding.clone();
+    entries.extend(
+        config
+            .wireguard_forwarding
+            .iter()
+            .cloned()
+            .map(WireGuardForwardingEntry::into_udp_forwarding_entry),
+    );
+    entries
 }
 
 fn ensure_server_mode_supported(config: &ServerConfig) -> Result<()> {
@@ -802,6 +823,8 @@ pub struct ClientConfig {
     pub tcp_forwarding: Vec<TcpForwardingEntry>,
     #[serde(default, rename = "udpForwarding")]
     pub udp_forwarding: Vec<UdpForwardingEntry>,
+    #[serde(default, rename = "wireguardForwarding")]
+    pub wireguard_forwarding: Vec<WireGuardForwardingEntry>,
     #[serde(default, rename = "tcpTProxy")]
     pub tcp_tproxy: Option<TcpTProxyConfig>,
     #[serde(default, rename = "udpTProxy")]
@@ -886,7 +909,7 @@ pub struct ClientQuicSockoptsConfig {
     pub fd_control_unix_socket: Option<String>,
 }
 
-#[derive(Debug, Clone, Deserialize, Default)]
+#[derive(Debug, Clone, Deserialize, Serialize, Default)]
 pub struct BandwidthConfig {
     #[serde(default)]
     pub up: String,
@@ -894,7 +917,7 @@ pub struct BandwidthConfig {
     pub down: String,
 }
 
-#[derive(Debug, Clone, Deserialize, Default)]
+#[derive(Debug, Clone, Deserialize, Serialize, Default)]
 pub struct Socks5Config {
     #[serde(default)]
     pub listen: String,
@@ -906,7 +929,7 @@ pub struct Socks5Config {
     pub disable_udp: bool,
 }
 
-#[derive(Debug, Clone, Deserialize, Default)]
+#[derive(Debug, Clone, Deserialize, Serialize, Default)]
 pub struct HttpConfig {
     #[serde(default)]
     pub listen: String,
@@ -918,7 +941,7 @@ pub struct HttpConfig {
     pub realm: String,
 }
 
-#[derive(Debug, Clone, Deserialize, Default)]
+#[derive(Debug, Clone, Deserialize, Serialize, Default)]
 pub struct TcpForwardingEntry {
     #[serde(default)]
     pub listen: String,
@@ -934,6 +957,83 @@ pub struct UdpForwardingEntry {
     pub remote: String,
     #[serde(default, with = "humantime_serde")]
     pub timeout: Duration,
+    #[serde(default, rename = "socketReceiveBuffer")]
+    pub socket_receive_buffer: usize,
+    #[serde(default, rename = "socketSendBuffer")]
+    pub socket_send_buffer: usize,
+    #[serde(default, rename = "channelDepth")]
+    pub channel_depth: usize,
+    #[serde(skip)]
+    pub wireguard_mtu: Option<u32>,
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct WireGuardForwardingEntry {
+    #[serde(default)]
+    pub listen: String,
+    #[serde(default)]
+    pub remote: String,
+    #[serde(default = "default_wireguard_forward_mtu")]
+    pub mtu: u32,
+    #[serde(default, with = "humantime_serde")]
+    pub timeout: Duration,
+    #[serde(default, rename = "socketReceiveBuffer")]
+    pub socket_receive_buffer: usize,
+    #[serde(default, rename = "socketSendBuffer")]
+    pub socket_send_buffer: usize,
+    #[serde(default, rename = "channelDepth")]
+    pub channel_depth: usize,
+}
+
+impl WireGuardForwardingEntry {
+    pub(crate) fn with_defaults(&self) -> Self {
+        Self {
+            listen: self.listen.clone(),
+            remote: self.remote.clone(),
+            mtu: if self.mtu == 0 {
+                WIREGUARD_FORWARD_DEFAULT_MTU
+            } else {
+                self.mtu
+            },
+            timeout: if self.timeout.is_zero() {
+                WIREGUARD_FORWARD_DEFAULT_TIMEOUT
+            } else {
+                self.timeout
+            },
+            socket_receive_buffer: if self.socket_receive_buffer == 0 {
+                WIREGUARD_FORWARD_DEFAULT_SOCKET_BUFFER
+            } else {
+                self.socket_receive_buffer
+            },
+            socket_send_buffer: if self.socket_send_buffer == 0 {
+                WIREGUARD_FORWARD_DEFAULT_SOCKET_BUFFER
+            } else {
+                self.socket_send_buffer
+            },
+            channel_depth: if self.channel_depth == 0 {
+                WIREGUARD_FORWARD_DEFAULT_CHANNEL_DEPTH
+            } else {
+                self.channel_depth
+            },
+        }
+    }
+
+    fn into_udp_forwarding_entry(self) -> UdpForwardingEntry {
+        let effective = self.with_defaults();
+        UdpForwardingEntry {
+            listen: effective.listen,
+            remote: effective.remote,
+            timeout: effective.timeout,
+            socket_receive_buffer: effective.socket_receive_buffer,
+            socket_send_buffer: effective.socket_send_buffer,
+            channel_depth: effective.channel_depth,
+            wireguard_mtu: Some(effective.mtu),
+        }
+    }
+}
+
+fn default_wireguard_forward_mtu() -> u32 {
+    WIREGUARD_FORWARD_DEFAULT_MTU
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]
@@ -1358,6 +1458,39 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("no client mode specified"));
+    }
+
+    #[test]
+    fn build_runnable_client_config_merges_wireguard_forwarding_with_defaults() {
+        let config = ClientConfig {
+            server: "127.0.0.1:443".into(),
+            tls: ClientTlsConfig {
+                insecure: true,
+                ..Default::default()
+            },
+            wireguard_forwarding: vec![WireGuardForwardingEntry {
+                listen: "127.0.0.1:51820".into(),
+                remote: "198.51.100.10:51820".into(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+
+        let runtime = build_runnable_client_config(&config).unwrap();
+        assert_eq!(runtime.udp_forwarding.len(), 1);
+        let entry = &runtime.udp_forwarding[0];
+        assert_eq!(entry.listen, "127.0.0.1:51820");
+        assert_eq!(entry.remote, "198.51.100.10:51820");
+        assert_eq!(entry.timeout, WIREGUARD_FORWARD_DEFAULT_TIMEOUT);
+        assert_eq!(
+            entry.socket_receive_buffer,
+            WIREGUARD_FORWARD_DEFAULT_SOCKET_BUFFER
+        );
+        assert_eq!(
+            entry.socket_send_buffer,
+            WIREGUARD_FORWARD_DEFAULT_SOCKET_BUFFER
+        );
+        assert_eq!(entry.channel_depth, WIREGUARD_FORWARD_DEFAULT_CHANNEL_DEPTH);
     }
 
     #[test]

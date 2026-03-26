@@ -24,7 +24,7 @@ use sha2::{Digest, Sha256};
 
 use crate::{
     CoreError, CoreResult,
-    limit::BandwidthLimiter,
+    limit::{BandwidthLimiter, negotiated_limit},
     protocol::{
         AuthRequest, URL_HOST, URL_PATH, auth_request_to_headers, auth_response_from_headers,
     },
@@ -32,7 +32,7 @@ use crate::{
     runtime_io,
     socket::{ObfsConfig, make_client_endpoint},
     stream::TcpProxyStream,
-    udp::{ClientUdpManager, UdpSession},
+    udp::{ClientUdpManager, UdpSession, UdpSessionConfig},
 };
 
 const ALPN_H3: &[u8] = b"h3";
@@ -153,10 +153,8 @@ impl Client {
         let auth_response = auth_response_from_headers(response.headers());
         let tx = if auth_response.rx_auto {
             0
-        } else if auth_response.rx == 0 || auth_response.rx > config.bandwidth_max_tx {
-            config.bandwidth_max_tx
         } else {
-            auth_response.rx
+            negotiated_limit(config.bandwidth_max_tx, auth_response.rx)
         };
         tx_target.store(tx, Ordering::Relaxed);
         let tx_limiter = BandwidthLimiter::optional(tx);
@@ -190,11 +188,15 @@ impl Client {
     }
 
     pub fn udp(&self) -> CoreResult<UdpSession> {
+        self.udp_with_config(UdpSessionConfig::default())
+    }
+
+    pub fn udp_with_config(&self, config: UdpSessionConfig) -> CoreResult<UdpSession> {
         let manager = self
             .udp_manager
             .as_ref()
             .ok_or_else(|| CoreError::Dial("UDP not enabled".into()))?;
-        manager.new_udp()
+        manager.new_udp(config)
     }
 
     pub fn remote_addr(&self) -> SocketAddr {

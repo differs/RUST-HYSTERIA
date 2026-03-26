@@ -64,6 +64,22 @@ fn udp_message_long_roundtrip_works() {
 }
 
 #[test]
+fn udp_message_allows_empty_payload() {
+    let message = UDPMessage {
+        session_id: 42,
+        packet_id: 7,
+        frag_id: 0,
+        frag_count: 1,
+        addr: "example.com:53".into(),
+        data: Vec::new(),
+    };
+
+    let mut buf = vec![0_u8; 256];
+    let n = message.serialize(&mut buf).unwrap();
+    assert_eq!(parse_udp_message(&buf[..n]).unwrap(), message);
+}
+
+#[test]
 fn malformed_udp_messages_fail() {
     let cases = [
         &b""[..],

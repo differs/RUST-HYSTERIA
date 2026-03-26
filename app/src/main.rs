@@ -4,23 +4,28 @@ mod http_proxy;
 mod share;
 mod socks5;
 mod speedtest;
+mod udp_bench;
 mod udp_forwarding;
 
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use clap::Parser;
-use cli::{AppMetadata, Cli, ClientArgs, Command, PingArgs, ServerArgs, ShareArgs, SpeedtestArgs};
+use cli::{
+    AppMetadata, Cli, ClientArgs, Command, PingArgs, ServerArgs, ShareArgs, SpeedtestArgs,
+    UdpBenchArgs,
+};
 use config::{
     build_client_core_config, build_runnable_client_config, build_runnable_server_config,
     load_client_config, load_server_config,
 };
 use http_proxy::serve_http_proxy;
 use hysteria_core::{Client, Server};
-use share::{build_share_uri, render_qr};
+use share::{build_share_config_yaml, build_share_uri, render_qr};
 use socks5::serve_socks5;
 use speedtest::run_speedtest_command;
 use tokio::{io::copy_bidirectional, net::TcpListener, task::JoinSet};
+use udp_bench::run_udp_bench_command;
 use udp_forwarding::serve_udp_forwarder;
 
 #[tokio::main]
@@ -42,6 +47,7 @@ async fn execute(cli: Cli, meta: AppMetadata) -> Result<()> {
         Command::Ping(args) => run_ping(&cli, &meta, &args).await,
         Command::Share(args) => run_share(&cli, &meta, &args),
         Command::Speedtest(args) => run_speedtest(&cli, &meta, &args).await,
+        Command::UdpBench(args) => run_udp_bench(&args).await,
         Command::Update => run_update(&cli, &meta),
     }
 }
@@ -247,14 +253,36 @@ async fn run_ping(cli: &Cli, _meta: &AppMetadata, args: &PingArgs) -> Result<()>
 
 fn run_share(cli: &Cli, _meta: &AppMetadata, args: &ShareArgs) -> Result<()> {
     let loaded = load_client_config(cli.config.as_deref())?;
-    let uri = build_share_uri(&loaded.value).context("failed to build share URI")?;
-    if !args.no_text {
-        println!("{uri}");
-    }
-    if args.qr {
-        println!("{}", render_qr(&uri).context("failed to render QR code")?);
-    }
+    print!("{}", build_share_output(&loaded.value, args)?);
     Ok(())
+}
+
+fn build_share_output(config: &config::ClientConfig, args: &ShareArgs) -> Result<String> {
+    let wants_yaml = args.yaml || args.yaml_only;
+    let uri = build_share_uri(config).context("failed to build share URI")?;
+    let yaml = wants_yaml
+        .then(|| build_share_config_yaml(config).context("failed to build share YAML"))
+        .transpose()?;
+    let qr = (!args.yaml_only && args.qr)
+        .then(|| render_qr(&uri).context("failed to render QR code"))
+        .transpose()?;
+
+    let mut sections = Vec::new();
+    if !args.yaml_only && !args.no_text {
+        sections.push(uri);
+    }
+    if let Some(qr) = qr {
+        sections.push(qr);
+    }
+    if let Some(yaml) = yaml {
+        sections.push(yaml.trim_end().to_string());
+    }
+
+    if sections.is_empty() {
+        return Ok(String::new());
+    }
+
+    Ok(format!("{}\n", sections.join("\n\n")))
 }
 
 async fn run_speedtest(cli: &Cli, _meta: &AppMetadata, args: &SpeedtestArgs) -> Result<()> {
@@ -296,6 +324,10 @@ async fn run_speedtest(cli: &Cli, _meta: &AppMetadata, args: &SpeedtestArgs) -> 
     Ok(())
 }
 
+async fn run_udp_bench(args: &UdpBenchArgs) -> Result<()> {
+    run_udp_bench_command(args).await
+}
+
 fn run_update(cli: &Cli, meta: &AppMetadata) -> Result<()> {
     println!("[skeleton] update check mode");
     println!(
@@ -326,5 +358,41 @@ async fn serve_tcp_forwarder(listener: TcpListener, client: Client, remote: Stri
                 }
             }
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::build_share_output;
+    use crate::{
+        cli::ShareArgs,
+        config::{ClientConfig, ClientTlsConfig, WireGuardForwardingEntry},
+    };
+
+    #[test]
+    fn share_yaml_only_omits_uri_and_qr_output() {
+        let config = ClientConfig {
+            server: "example.com:443".into(),
+            auth: "hunter2".into(),
+            tls: ClientTlsConfig {
+                insecure: true,
+                ..Default::default()
+            },
+            wireguard_forwarding: vec![WireGuardForwardingEntry {
+                listen: "127.0.0.1:51820".into(),
+                remote: "198.51.100.10:51820".into(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let args = ShareArgs {
+            yaml_only: true,
+            ..Default::default()
+        };
+
+        let output = build_share_output(&config, &args).unwrap();
+        assert!(!output.contains("hysteria2://"));
+        assert!(output.contains("wireguardForwarding:"));
+        assert!(output.contains("mtu: 1280"));
     }
 }

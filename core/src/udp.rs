@@ -24,9 +24,22 @@ use crate::{
     protocol::{MAX_DATAGRAM_FRAME_SIZE, MAX_UDP_SIZE, UDPMessage, parse_udp_message},
 };
 
-const CLIENT_UDP_MESSAGE_CHANNEL_SIZE: usize = 1024;
+pub const DEFAULT_CLIENT_UDP_MESSAGE_CHANNEL_SIZE: usize = 1024;
 const UDP_IDLE_CLEANUP_INTERVAL: Duration = Duration::from_secs(1);
 pub(crate) const DEFAULT_UDP_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct UdpSessionConfig {
+    pub message_channel_size: usize,
+}
+
+impl Default for UdpSessionConfig {
+    fn default() -> Self {
+        Self {
+            message_channel_size: DEFAULT_CLIENT_UDP_MESSAGE_CHANNEL_SIZE,
+        }
+    }
+}
 
 #[derive(Clone)]
 pub struct UdpSession {
@@ -137,13 +150,18 @@ impl ClientUdpManager {
         manager
     }
 
-    pub(crate) fn new_udp(self: &Arc<Self>) -> CoreResult<UdpSession> {
+    pub(crate) fn new_udp(self: &Arc<Self>, config: UdpSessionConfig) -> CoreResult<UdpSession> {
         if self.closed.load(Ordering::Acquire) {
             return Err(CoreError::Closed("udp session manager closed".into()));
         }
+        if config.message_channel_size == 0 {
+            return Err(CoreError::Config(
+                "udp session message_channel_size must be greater than 0".into(),
+            ));
+        }
 
         let session_id = self.next_id.fetch_add(1, Ordering::AcqRel);
-        let (sender, receiver) = mpsc::channel(CLIENT_UDP_MESSAGE_CHANNEL_SIZE);
+        let (sender, receiver) = mpsc::channel(config.message_channel_size);
         self.sessions
             .lock()
             .expect("udp session mutex poisoned")

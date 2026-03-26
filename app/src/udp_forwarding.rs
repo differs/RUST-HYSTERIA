@@ -1,6 +1,6 @@
 use std::{
     collections::HashMap,
-    net::SocketAddr,
+    net::{SocketAddr, UdpSocket as StdUdpSocket},
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
@@ -9,7 +9,8 @@ use std::{
 };
 
 use anyhow::{Context, Result};
-use hysteria_core::{Client, UdpSession};
+use hysteria_core::{Client, UdpSession, UdpSessionConfig};
+use socket2::SockRef;
 use tokio::{net::UdpSocket, sync::Mutex, task::JoinHandle, time};
 
 use crate::config::UdpForwardingEntry;
@@ -19,23 +20,45 @@ const IDLE_CLEANUP_INTERVAL: Duration = Duration::from_secs(1);
 const UDP_BUFFER_SIZE: usize = 64 * 1024;
 
 pub async fn serve_udp_forwarder(config: UdpForwardingEntry, client: Client) -> Result<()> {
-    let socket =
-        Arc::new(UdpSocket::bind(&config.listen).await.with_context(|| {
-            format!("failed to bind UDP forwarding listener {}", config.listen)
-        })?);
-    println!(
-        "udp forwarding: {} -> {}",
-        socket
-            .local_addr()
-            .context("failed to read UDP forwarding listen address")?,
-        config.remote
-    );
+    let socket = Arc::new(bind_udp_forward_socket(&config)?);
+    let local_addr = socket
+        .local_addr()
+        .context("failed to read UDP forwarding listen address")?;
 
     let timeout = if config.timeout.is_zero() {
         DEFAULT_TIMEOUT
     } else {
         config.timeout
     };
+    let session_config = UdpSessionConfig {
+        message_channel_size: if config.channel_depth == 0 {
+            UdpSessionConfig::default().message_channel_size
+        } else {
+            config.channel_depth
+        },
+    };
+    if let Some(mtu) = config.wireguard_mtu {
+        println!(
+            "wireguard forwarding: {} -> {} mtu={} timeout={} socket_recv_buffer={} socket_send_buffer={} channel_depth={}",
+            local_addr,
+            config.remote,
+            mtu,
+            humantime::format_duration(timeout),
+            config.socket_receive_buffer.max(0),
+            config.socket_send_buffer.max(0),
+            session_config.message_channel_size,
+        );
+    } else {
+        println!(
+            "udp forwarding: {} -> {} timeout={} socket_recv_buffer={} socket_send_buffer={} channel_depth={}",
+            local_addr,
+            config.remote,
+            humantime::format_duration(timeout),
+            config.socket_receive_buffer.max(0),
+            config.socket_send_buffer.max(0),
+            session_config.message_channel_size,
+        );
+    }
     let sessions = Arc::new(Mutex::new(
         HashMap::<SocketAddr, Arc<UdpForwardSession>>::new(),
     ));
@@ -49,9 +72,14 @@ pub async fn serve_udp_forwarder(config: UdpForwardingEntry, client: Client) -> 
                 .await
                 .with_context(|| format!("failed to receive UDP packet for {}", config.remote))?;
 
-            let session =
-                get_or_create_session(socket.clone(), sessions.clone(), client.clone(), peer_addr)
-                    .await?;
+            let session = get_or_create_session(
+                socket.clone(),
+                sessions.clone(),
+                client.clone(),
+                peer_addr,
+                session_config,
+            )
+            .await?;
 
             if let Err(err) = session.feed(&buffer[..size], &config.remote).await {
                 eprintln!(
@@ -101,13 +129,14 @@ async fn get_or_create_session(
     sessions: Arc<Mutex<HashMap<SocketAddr, Arc<UdpForwardSession>>>>,
     client: Client,
     peer_addr: SocketAddr,
+    session_config: UdpSessionConfig,
 ) -> Result<Arc<UdpForwardSession>> {
     if let Some(existing) = sessions.lock().await.get(&peer_addr).cloned() {
         return Ok(existing);
     }
 
     let tunnel = client
-        .udp()
+        .udp_with_config(session_config)
         .with_context(|| format!("failed to open proxied UDP session for {peer_addr}"))?;
     let receive_tunnel = tunnel.clone();
     let receive_socket = socket.clone();
@@ -200,5 +229,29 @@ async fn close_all_sessions(sessions: Arc<Mutex<HashMap<SocketAddr, Arc<UdpForwa
     let entries: Vec<_> = sessions.lock().await.drain().collect();
     for (_, session) in entries {
         let _ = session.tunnel.close().await;
+    }
+}
+
+fn bind_udp_forward_socket(config: &UdpForwardingEntry) -> Result<UdpSocket> {
+    let socket = StdUdpSocket::bind(&config.listen)
+        .with_context(|| format!("failed to bind UDP forwarding listener {}", config.listen))?;
+    configure_socket_buffers(
+        &socket,
+        config.socket_receive_buffer,
+        config.socket_send_buffer,
+    );
+    socket
+        .set_nonblocking(true)
+        .context("failed to mark UDP forwarding socket nonblocking")?;
+    UdpSocket::from_std(socket).context("failed to create async UDP forwarding socket")
+}
+
+fn configure_socket_buffers(socket: &StdUdpSocket, recv: usize, send: usize) {
+    let sock_ref = SockRef::from(socket);
+    if recv > 0 {
+        let _ = sock_ref.set_recv_buffer_size(recv);
+    }
+    if send > 0 {
+        let _ = sock_ref.set_send_buffer_size(send);
     }
 }

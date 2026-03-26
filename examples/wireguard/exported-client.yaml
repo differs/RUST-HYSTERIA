@@ -1,0 +1,12 @@
+server: your-hysteria-server.example.com:443
+auth: your-password
+tls:
+  ca: /etc/ssl/certs/your-ca.pem
+wireguardForwarding:
+  - listen: 127.0.0.1:51820
+    remote: 203.0.113.10:51820
+    mtu: 1280
+    timeout: 300s
+    socketReceiveBuffer: 8388608
+    socketSendBuffer: 8388608
+    channelDepth: 4096

@@ -67,7 +67,7 @@ pub fn parse_udp_message(buf: &[u8]) -> Result<UDPMessage, ProtocolError> {
     let addr_len = addr_len as usize;
     let addr_start = 8 + addr_len_size;
     let addr_end = addr_start + addr_len;
-    if buf.len() <= addr_end {
+    if buf.len() < addr_end {
         return Err(ProtocolError::InvalidMessageLength);
     }
 

@@ -1,8 +1,12 @@
 use anyhow::{Result, bail};
 use qrcode::{QrCode, render::unicode};
+use serde::Serialize;
 use url::form_urlencoded::Serializer;
 
-use crate::config::{ClientConfig, normalize_cert_hash, normalize_client_config};
+use crate::config::{
+    BandwidthConfig, ClientConfig, HttpConfig, Socks5Config, TcpForwardingEntry,
+    UdpForwardingEntry, WireGuardForwardingEntry, normalize_cert_hash, normalize_client_config,
+};
 
 pub fn build_share_uri(config: &ClientConfig) -> Result<String> {
     let config = normalize_client_config(config)?;
@@ -56,6 +60,12 @@ pub fn render_qr(data: &str) -> Result<String> {
     Ok(code.render::<unicode::Dense1x2>().quiet_zone(false).build())
 }
 
+pub fn build_share_config_yaml(config: &ClientConfig) -> Result<String> {
+    let config = normalize_client_config(config)?;
+    let export = ShareConfigExport::from_config(&config);
+    Ok(serde_yaml::to_string(&export)?)
+}
+
 fn encode_auth(auth: &str) -> String {
     match auth.split_once(':') {
         Some((username, password)) => {
@@ -104,10 +114,183 @@ fn should_escape_userinfo(byte: u8) -> bool {
     )
 }
 
+#[derive(Debug, Serialize)]
+struct ShareConfigExport {
+    server: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    auth: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tls: Option<ShareTlsExport>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    obfs: Option<ShareObfsExport>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    bandwidth: Option<BandwidthConfig>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    socks5: Option<Socks5Config>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    http: Option<HttpConfig>,
+    #[serde(skip_serializing_if = "Vec::is_empty", rename = "tcpForwarding")]
+    tcp_forwarding: Vec<TcpForwardingEntry>,
+    #[serde(skip_serializing_if = "Vec::is_empty", rename = "udpForwarding")]
+    udp_forwarding: Vec<ShareUdpForwardingExport>,
+    #[serde(skip_serializing_if = "Vec::is_empty", rename = "wireguardForwarding")]
+    wireguard_forwarding: Vec<ShareWireGuardForwardingExport>,
+}
+
+#[derive(Debug, Serialize)]
+struct ShareTlsExport {
+    #[serde(skip_serializing_if = "String::is_empty")]
+    sni: String,
+    #[serde(skip_serializing_if = "is_false")]
+    insecure: bool,
+    #[serde(skip_serializing_if = "String::is_empty", rename = "pinSHA256")]
+    pin_sha256: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    ca: String,
+}
+
+#[derive(Debug, Serialize)]
+struct ShareObfsExport {
+    #[serde(rename = "type")]
+    kind: String,
+    salamander: ShareSalamanderExport,
+}
+
+#[derive(Debug, Serialize)]
+struct ShareSalamanderExport {
+    password: String,
+}
+
+#[derive(Debug, Serialize)]
+struct ShareUdpForwardingExport {
+    listen: String,
+    remote: String,
+    #[serde(skip_serializing_if = "is_zero_duration", with = "humantime_serde")]
+    timeout: std::time::Duration,
+    #[serde(skip_serializing_if = "is_zero_usize", rename = "socketReceiveBuffer")]
+    socket_receive_buffer: usize,
+    #[serde(skip_serializing_if = "is_zero_usize", rename = "socketSendBuffer")]
+    socket_send_buffer: usize,
+    #[serde(skip_serializing_if = "is_zero_usize", rename = "channelDepth")]
+    channel_depth: usize,
+}
+
+#[derive(Debug, Serialize)]
+struct ShareWireGuardForwardingExport {
+    listen: String,
+    remote: String,
+    mtu: u32,
+    #[serde(with = "humantime_serde")]
+    timeout: std::time::Duration,
+    #[serde(rename = "socketReceiveBuffer")]
+    socket_receive_buffer: usize,
+    #[serde(rename = "socketSendBuffer")]
+    socket_send_buffer: usize,
+    #[serde(rename = "channelDepth")]
+    channel_depth: usize,
+}
+
+impl ShareConfigExport {
+    fn from_config(config: &ClientConfig) -> Self {
+        let tls = (!config.tls.sni.is_empty()
+            || config.tls.insecure
+            || !config.tls.pin_sha256.is_empty()
+            || !config.tls.ca.is_empty())
+        .then(|| ShareTlsExport {
+            sni: config.tls.sni.clone(),
+            insecure: config.tls.insecure,
+            pin_sha256: config.tls.pin_sha256.clone(),
+            ca: config.tls.ca.clone(),
+        });
+
+        let obfs = match config.obfs.r#type.trim().to_ascii_lowercase().as_str() {
+            "salamander" => Some(ShareObfsExport {
+                kind: "salamander".to_string(),
+                salamander: ShareSalamanderExport {
+                    password: config.obfs.salamander.password.clone(),
+                },
+            }),
+            _ => None,
+        };
+
+        let bandwidth = (!config.bandwidth.up.is_empty() || !config.bandwidth.down.is_empty())
+            .then(|| config.bandwidth.clone());
+
+        let socks5 = config.socks5.clone();
+        let http = config.http.clone();
+        let tcp_forwarding = config.tcp_forwarding.clone();
+        let udp_forwarding = config
+            .udp_forwarding
+            .iter()
+            .cloned()
+            .map(ShareUdpForwardingExport::from)
+            .collect();
+        let wireguard_forwarding = config
+            .wireguard_forwarding
+            .iter()
+            .map(|entry| ShareWireGuardForwardingExport::from(entry.with_defaults()))
+            .collect();
+
+        Self {
+            server: config.server.clone(),
+            auth: config.auth.clone(),
+            tls,
+            obfs,
+            bandwidth,
+            socks5,
+            http,
+            tcp_forwarding,
+            udp_forwarding,
+            wireguard_forwarding,
+        }
+    }
+}
+
+impl From<UdpForwardingEntry> for ShareUdpForwardingExport {
+    fn from(value: UdpForwardingEntry) -> Self {
+        Self {
+            listen: value.listen,
+            remote: value.remote,
+            timeout: value.timeout,
+            socket_receive_buffer: value.socket_receive_buffer,
+            socket_send_buffer: value.socket_send_buffer,
+            channel_depth: value.channel_depth,
+        }
+    }
+}
+
+impl From<WireGuardForwardingEntry> for ShareWireGuardForwardingExport {
+    fn from(value: WireGuardForwardingEntry) -> Self {
+        Self {
+            listen: value.listen,
+            remote: value.remote,
+            mtu: value.mtu,
+            timeout: value.timeout,
+            socket_receive_buffer: value.socket_receive_buffer,
+            socket_send_buffer: value.socket_send_buffer,
+            channel_depth: value.channel_depth,
+        }
+    }
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
+}
+
+fn is_zero_duration(value: &std::time::Duration) -> bool {
+    value.is_zero()
+}
+
+fn is_zero_usize(value: &usize) -> bool {
+    *value == 0
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{ClientConfig, ClientObfsConfig, ClientTlsConfig, SalamanderConfig};
+    use crate::config::{
+        ClientConfig, ClientObfsConfig, ClientTlsConfig, SalamanderConfig, WireGuardForwardingEntry,
+    };
 
     #[test]
     fn build_share_uri_matches_go_examples() {
@@ -186,5 +369,33 @@ mod tests {
         .unwrap();
         assert_eq!(normalized.server, "example.com:443");
         assert_eq!(normalized.auth, "john:doe:p@ss/wo?rd+ok");
+    }
+
+    #[test]
+    fn share_yaml_exports_wireguard_forwarding_with_defaults() {
+        let config = ClientConfig {
+            server: "example.com:443".to_string(),
+            auth: "hunter2".to_string(),
+            tls: ClientTlsConfig {
+                insecure: true,
+                ..Default::default()
+            },
+            wireguard_forwarding: vec![WireGuardForwardingEntry {
+                listen: "127.0.0.1:51820".to_string(),
+                remote: "198.51.100.10:51820".to_string(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+
+        let yaml = build_share_config_yaml(&config).unwrap();
+        assert!(yaml.contains("wireguardForwarding:"));
+        assert!(yaml.contains("listen: 127.0.0.1:51820"));
+        assert!(yaml.contains("remote: 198.51.100.10:51820"));
+        assert!(yaml.contains("mtu: 1280"));
+        assert!(yaml.contains("timeout:"));
+        assert!(yaml.contains("socketReceiveBuffer: 8388608"));
+        assert!(yaml.contains("socketSendBuffer: 8388608"));
+        assert!(yaml.contains("channelDepth: 4096"));
     }
 }

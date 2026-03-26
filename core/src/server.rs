@@ -19,7 +19,7 @@ use tokio::net::TcpStream;
 
 use crate::{
     CoreError, CoreResult,
-    limit::BandwidthLimiter,
+    limit::{BandwidthLimiter, negotiated_limit},
     protocol::{
         AuthResponse, STATUS_AUTH_OK, URL_HOST, URL_PATH, auth_request_from_headers,
         auth_response_to_headers,
@@ -237,10 +237,8 @@ async fn handle_connection(
 
     let actual_tx = if state.ignore_client_bandwidth {
         0
-    } else if state.bandwidth_max_tx > 0 && auth_request.rx > state.bandwidth_max_tx {
-        state.bandwidth_max_tx
     } else {
-        auth_request.rx
+        negotiated_limit(state.bandwidth_max_tx, auth_request.rx)
     };
     tx_target.store(actual_tx, Ordering::Relaxed);
     let mut response = Response::builder().status(STATUS_AUTH_OK).body(())?;

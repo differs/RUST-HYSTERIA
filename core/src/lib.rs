@@ -25,4 +25,4 @@ pub use quic::{
 pub use server::{Authenticator, PasswordAuthenticator, Server, ServerConfig};
 pub use socket::ObfsConfig;
 pub use stream::TcpProxyStream;
-pub use udp::UdpSession;
+pub use udp::{DEFAULT_CLIENT_UDP_MESSAGE_CHANNEL_SIZE, UdpSession, UdpSessionConfig};

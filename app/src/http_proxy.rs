@@ -106,11 +106,13 @@ async fn handle_connection(
         }
 
         let keep_alive_requested = request_keep_alive(&request);
+        let request_body_kind = request_body_kind(&request.headers)?;
         let keep_alive = handle_http_request(
             &mut stream,
             &client,
             request,
             &mut client_buffer,
+            request_body_kind,
             keep_alive_requested,
         )
         .await?;
@@ -304,9 +306,9 @@ async fn handle_http_request(
     client: &Client,
     request: HttpRequestHead,
     client_buffer: &mut Vec<u8>,
+    request_body_kind: BodyKind,
     keep_alive_requested: bool,
 ) -> Result<bool> {
-    let request_body_kind = request_body_kind(&request.headers)?;
     let (request_addr, request_target, host_header) =
         parse_proxy_target(&request.target, &request.headers)?;
 
@@ -318,8 +320,9 @@ async fn handle_http_request(
         }
     };
 
-    let outbound_request = build_outbound_request(&request, &request_target, &host_header)
-        .context("build outbound request")?;
+    let outbound_request =
+        build_outbound_request(&request, &request_target, &host_header, request_body_kind)
+            .context("build outbound request")?;
     remote.write_all(&outbound_request).await?;
     transfer_body(&mut *stream, client_buffer, &mut remote, request_body_kind).await?;
     remote.shutdown().await?;
@@ -337,6 +340,7 @@ async fn handle_http_request(
             keep_alive_requested && body_kind != BodyKind::UntilEof && !is_informational;
         let outbound_response = build_outbound_response(
             &response,
+            body_kind,
             if is_informational {
                 None
             } else {
@@ -597,6 +601,7 @@ fn build_outbound_request(
     request: &HttpRequestHead,
     request_target: &str,
     host_header: &str,
+    body_kind: BodyKind,
 ) -> Result<Vec<u8>> {
     let mut bytes = format!(
         "{} {} {}\r\n",
@@ -606,7 +611,7 @@ fn build_outbound_request(
     let mut saw_host = false;
 
     for (name, value) in &request.headers {
-        if should_skip_request_header(name) {
+        if should_skip_request_header(name, body_kind) {
             continue;
         }
         if name.eq_ignore_ascii_case("Host") {
@@ -626,6 +631,7 @@ fn build_outbound_request(
 
 fn build_outbound_response(
     response: &HttpResponseHead,
+    body_kind: BodyKind,
     keep_alive: Option<bool>,
 ) -> Result<Vec<u8>> {
     let reason = if response.reason.is_empty() {
@@ -639,7 +645,7 @@ fn build_outbound_response(
 
     let mut bytes = format!("{} {} {}\r\n", response.version, response.status, reason).into_bytes();
     for (name, value) in &response.headers {
-        if should_skip_response_header(name) {
+        if should_skip_response_header(name, body_kind) {
             continue;
         }
         bytes.extend_from_slice(format!("{name}: {value}\r\n").as_bytes());
@@ -660,7 +666,10 @@ fn build_outbound_response(
     Ok(bytes)
 }
 
-fn should_skip_request_header(name: &str) -> bool {
+fn should_skip_request_header(name: &str, body_kind: BodyKind) -> bool {
+    if body_kind == BodyKind::Chunked && name.eq_ignore_ascii_case("Content-Length") {
+        return true;
+    }
     matches!(
         name.to_ascii_lowercase().as_str(),
         "proxy-connection"
@@ -674,7 +683,10 @@ fn should_skip_request_header(name: &str) -> bool {
     )
 }
 
-fn should_skip_response_header(name: &str) -> bool {
+fn should_skip_response_header(name: &str, body_kind: BodyKind) -> bool {
+    if body_kind == BodyKind::Chunked && name.eq_ignore_ascii_case("Content-Length") {
+        return true;
+    }
     matches!(
         name.to_ascii_lowercase().as_str(),
         "proxy-connection"
@@ -752,4 +764,56 @@ async fn send_proxy_auth_required(
     );
     stream.write_all(response.as_bytes()).await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        BodyKind, HttpRequestHead, HttpResponseHead, build_outbound_request,
+        build_outbound_response, request_body_kind,
+    };
+
+    #[test]
+    fn chunked_requests_strip_content_length_before_forwarding() {
+        let request = HttpRequestHead {
+            method: "POST".into(),
+            target: "http://example.com/upload".into(),
+            version: "HTTP/1.1".into(),
+            headers: vec![
+                ("Host".into(), "example.com".into()),
+                ("Transfer-Encoding".into(), "chunked".into()),
+                ("Content-Length".into(), "5".into()),
+            ],
+        };
+
+        let body_kind = request_body_kind(&request.headers).unwrap();
+        assert_eq!(body_kind, BodyKind::Chunked);
+
+        let outbound = String::from_utf8(
+            build_outbound_request(&request, "/upload", "example.com", body_kind).unwrap(),
+        )
+        .unwrap();
+        assert!(outbound.contains("Transfer-Encoding: chunked\r\n"));
+        assert!(!outbound.contains("Content-Length:"));
+    }
+
+    #[test]
+    fn chunked_responses_strip_content_length_before_forwarding() {
+        let response = HttpResponseHead {
+            version: "HTTP/1.1".into(),
+            status: 200,
+            reason: "OK".into(),
+            headers: vec![
+                ("Transfer-Encoding".into(), "chunked".into()),
+                ("Content-Length".into(), "12".into()),
+            ],
+        };
+
+        let outbound = String::from_utf8(
+            build_outbound_response(&response, BodyKind::Chunked, Some(false)).unwrap(),
+        )
+        .unwrap();
+        assert!(outbound.contains("Transfer-Encoding: chunked\r\n"));
+        assert!(!outbound.contains("Content-Length:"));
+    }
 }
