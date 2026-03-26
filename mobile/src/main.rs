@@ -28,6 +28,7 @@ use rustls::pki_types::CertificateDer;
 use serde::Deserialize;
 use url::Url;
 use vpn_tun2socks::{Tun2SocksConfig, Tun2SocksHandle};
+use crate::android_bridge::CaCatalog;
 
 #[cfg(target_os = "android")]
 use jni::{
