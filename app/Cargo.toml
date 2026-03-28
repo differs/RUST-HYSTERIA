@@ -29,4 +29,5 @@ tokio = { workspace = true, features = ["signal"] }
 url = "2.5"
 
 [dev-dependencies]
+rcgen = "0.13.2"
 tempfile = "3.23"

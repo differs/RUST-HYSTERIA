@@ -1,26 +1,52 @@
 use anyhow::Result;
 
+#[allow(dead_code)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Tun2SocksUdpMode {
+    Disabled,
+    Tcp,
+    Udp,
+}
+
 #[derive(Clone, Debug)]
 pub struct Tun2SocksConfig {
     pub socks_host: String,
     pub socks_port: u16,
+    pub udp_mode: Tun2SocksUdpMode,
     pub tunnel_name: String,
     pub mtu: u16,
     pub ipv4_addr: String,
     pub ipv6_addr: Option<String>,
+    pub connect_timeout_ms: Option<u32>,
 }
 
 impl Tun2SocksConfig {
     pub fn render(&self) -> String {
+        let udp_mode = match self.udp_mode {
+            Tun2SocksUdpMode::Disabled => "off",
+            Tun2SocksUdpMode::Tcp => "tcp",
+            Tun2SocksUdpMode::Udp => "udp",
+        };
         let ipv6 = self
             .ipv6_addr
             .as_deref()
             .map(|addr| format!("\n  ipv6: '{addr}'"))
             .unwrap_or_default();
+        let connect_timeout = self
+            .connect_timeout_ms
+            .map(|value| format!("  connect-timeout: {value}\n"))
+            .unwrap_or_default();
 
         format!(
-            "tunnel:\n  name: {}\n  mtu: {}\n  multi-queue: false\n  ipv4: {}{}\n\nsocks5:\n  address: {}\n  port: {}\n  udp: 'udp'\n\nmisc:\n  log-file: stderr\n  log-level: info\n",
-            self.tunnel_name, self.mtu, self.ipv4_addr, ipv6, self.socks_host, self.socks_port,
+            "tunnel:\n  name: {}\n  mtu: {}\n  multi-queue: false\n  ipv4: {}{}\n\nsocks5:\n  address: {}\n  port: {}\n  udp: '{}'\nmisc:\n{}  log-file: stderr\n  log-level: info\n",
+            self.tunnel_name,
+            self.mtu,
+            self.ipv4_addr,
+            ipv6,
+            self.socks_host,
+            self.socks_port,
+            udp_mode,
+            connect_timeout,
         )
     }
 }

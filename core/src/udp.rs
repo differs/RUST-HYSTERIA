@@ -1,5 +1,6 @@
 use std::{
     collections::HashMap,
+    future::Future,
     fmt,
     net::SocketAddr,
     sync::{
@@ -295,6 +296,7 @@ struct ServerUdpSession {
     close_tx: mpsc::UnboundedSender<u32>,
     defragger: Defragger,
     socket: Option<Arc<UdpSocket>>,
+    resolved_targets: ResolvedUdpTargets,
     receive_task: Option<JoinHandle<()>>,
     last_activity: Instant,
 }
@@ -313,6 +315,7 @@ impl ServerUdpSession {
             close_tx,
             defragger: Defragger::default(),
             socket: None,
+            resolved_targets: ResolvedUdpTargets::default(),
             receive_task: None,
             last_activity: Instant::now(),
         }
@@ -329,7 +332,8 @@ impl ServerUdpSession {
         }
 
         if let Some(socket) = &self.socket {
-            send_udp_packet(socket, &message.addr, &message.data).await?;
+            let target = self.resolved_targets.resolve(&message.addr).await?;
+            send_udp_packet(socket, target, &message.data).await?;
         }
         Ok(())
     }
@@ -366,27 +370,58 @@ impl ServerUdpSession {
 }
 
 async fn resolve_udp_bind_addr(addr: &str) -> CoreResult<SocketAddr> {
-    let mut resolved = lookup_host(addr)
-        .await
-        .map_err(|err| CoreError::Dial(err.to_string()))?;
-    let target = resolved
-        .next()
-        .ok_or_else(|| CoreError::Dial(format!("failed to resolve udp target {addr}")))?;
+    let target = resolve_udp_target(addr).await?;
     Ok(match target {
         SocketAddr::V4(_) => "0.0.0.0:0".parse().expect("valid ipv4 bind address"),
         SocketAddr::V6(_) => "[::]:0".parse().expect("valid ipv6 bind address"),
     })
 }
 
-async fn send_udp_packet(socket: &UdpSocket, addr: &str, data: &[u8]) -> CoreResult<()> {
+async fn send_udp_packet(socket: &UdpSocket, target: SocketAddr, data: &[u8]) -> CoreResult<()> {
+    socket.send_to(data, target).await?;
+    Ok(())
+}
+
+async fn resolve_udp_target(addr: &str) -> CoreResult<SocketAddr> {
     let mut resolved = lookup_host(addr)
         .await
         .map_err(|err| CoreError::Dial(err.to_string()))?;
-    let target = resolved
+    resolved
         .next()
-        .ok_or_else(|| CoreError::Dial(format!("failed to resolve udp target {addr}")))?;
-    socket.send_to(data, target).await?;
-    Ok(())
+        .ok_or_else(|| CoreError::Dial(format!("failed to resolve udp target {addr}")))
+}
+
+#[derive(Debug, Default)]
+struct ResolvedUdpTargets {
+    by_destination: HashMap<String, SocketAddr>,
+}
+
+impl ResolvedUdpTargets {
+    async fn resolve(&mut self, destination: &str) -> CoreResult<SocketAddr> {
+        let owned_destination = destination.to_string();
+        self.get_or_resolve(destination, move || async move {
+            resolve_udp_target(&owned_destination).await
+        })
+        .await
+    }
+
+    async fn get_or_resolve<F, Fut>(
+        &mut self,
+        destination: &str,
+        resolver: F,
+    ) -> CoreResult<SocketAddr>
+    where
+        F: FnOnce() -> Fut,
+        Fut: Future<Output = CoreResult<SocketAddr>>,
+    {
+        if let Some(target) = self.by_destination.get(destination).copied() {
+            return Ok(target);
+        }
+
+        let target = resolver().await?;
+        self.by_destination.insert(destination.to_string(), target);
+        Ok(target)
+    }
 }
 
 async fn server_udp_receive_loop(
@@ -451,4 +486,82 @@ async fn send_single_udp_message(
         limiter.wait_for(size).await;
     }
     connection.send_datagram(Bytes::copy_from_slice(&buffer[..size]))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+
+    use super::*;
+
+    #[tokio::test]
+    async fn resolved_udp_targets_cache_first_resolution_for_same_destination() {
+        let mut targets = ResolvedUdpTargets::default();
+        let resolver_calls = Arc::new(AtomicUsize::new(0));
+        let first: SocketAddr = "127.0.0.1:10001".parse().expect("parse first socket");
+        let second: SocketAddr = "127.0.0.1:10002".parse().expect("parse second socket");
+
+        let resolved_first = targets
+            .get_or_resolve("example.com:443", {
+                let resolver_calls = resolver_calls.clone();
+                move || async move {
+                    let call_index = resolver_calls.fetch_add(1, Ordering::AcqRel);
+                    Ok(if call_index == 0 { first } else { second })
+                }
+            })
+            .await
+            .expect("resolve first destination");
+
+        let resolved_second = targets
+            .get_or_resolve("example.com:443", {
+                let resolver_calls = resolver_calls.clone();
+                move || async move {
+                    let call_index = resolver_calls.fetch_add(1, Ordering::AcqRel);
+                    Ok(if call_index == 0 { first } else { second })
+                }
+            })
+            .await
+            .expect("resolve cached destination");
+
+        assert_eq!(resolved_first, first);
+        assert_eq!(resolved_second, first);
+        assert_eq!(resolver_calls.load(Ordering::Acquire), 1);
+    }
+
+    #[tokio::test]
+    async fn resolved_udp_targets_keep_distinct_destinations_separate() {
+        let mut targets = ResolvedUdpTargets::default();
+        let resolver_calls = Arc::new(AtomicUsize::new(0));
+        let alpha: SocketAddr = "127.0.0.1:10011".parse().expect("parse alpha socket");
+        let beta: SocketAddr = "127.0.0.1:10012".parse().expect("parse beta socket");
+
+        let resolved_alpha = targets
+            .get_or_resolve("alpha.example:443", {
+                let resolver_calls = resolver_calls.clone();
+                move || async move {
+                    resolver_calls.fetch_add(1, Ordering::AcqRel);
+                    Ok(alpha)
+                }
+            })
+            .await
+            .expect("resolve alpha destination");
+
+        let resolved_beta = targets
+            .get_or_resolve("beta.example:443", {
+                let resolver_calls = resolver_calls.clone();
+                move || async move {
+                    resolver_calls.fetch_add(1, Ordering::AcqRel);
+                    Ok(beta)
+                }
+            })
+            .await
+            .expect("resolve beta destination");
+
+        assert_eq!(resolved_alpha, alpha);
+        assert_eq!(resolved_beta, beta);
+        assert_eq!(resolver_calls.load(Ordering::Acquire), 2);
+    }
 }

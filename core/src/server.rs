@@ -19,6 +19,7 @@ use tokio::net::TcpStream;
 
 use crate::{
     CoreError, CoreResult,
+    health::HEALTH_CHECK_DEST,
     limit::{BandwidthLimiter, negotiated_limit},
     protocol::{
         AuthResponse, STATUS_AUTH_OK, URL_HOST, URL_PATH, auth_request_from_headers,
@@ -328,6 +329,25 @@ async fn handle_tcp_stream(
     tx_limiter: Option<Arc<BandwidthLimiter>>,
 ) -> CoreResult<()> {
     let req_addr = runtime_io::read_framed_tcp_request(&mut recv).await?;
+    if is_healthcheck_request(&req_addr) {
+        runtime_io::write_tcp_response(&mut send, true, "Connected").await?;
+        let payload = recv
+            .read_to_end(64)
+            .await
+            .map_err(|err| CoreError::Transport(err.to_string()))?;
+        if payload != b"ping" {
+            let _ = send.write_all(b"bad-healthcheck").await;
+            send.finish()
+                .map_err(|finish_err| CoreError::Transport(finish_err.to_string()))?;
+            return Err(CoreError::Dial("invalid healthcheck payload".into()));
+        }
+        send.write_all(b"pong")
+            .await
+            .map_err(|err| CoreError::Transport(err.to_string()))?;
+        send.finish()
+            .map_err(|finish_err| CoreError::Transport(finish_err.to_string()))?;
+        return Ok(());
+    }
     if is_speedtest_request(&req_addr) {
         if !speed_test_enabled {
             let _ = runtime_io::write_tcp_response(&mut send, false, "speed test disabled").await;
@@ -357,6 +377,10 @@ async fn handle_tcp_stream(
             Err(CoreError::Dial(err.to_string()))
         }
     }
+}
+
+fn is_healthcheck_request(addr: &str) -> bool {
+    matches!(addr.trim(), HEALTH_CHECK_DEST)
 }
 
 fn is_speedtest_request(addr: &str) -> bool {

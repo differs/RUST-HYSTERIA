@@ -2,6 +2,7 @@ use std::{sync::Arc, time::Duration};
 
 use hysteria_core::{
     Client, ClientConfig, CoreError, ObfsConfig, PasswordAuthenticator, Server, ServerConfig,
+    run_client_health_check,
 };
 use hysteria_extras::speedtest::Client as SpeedtestClient;
 use rcgen::{CertifiedKey, generate_simple_self_signed};
@@ -173,6 +174,28 @@ async fn spawn_udp_echo_server() -> (std::net::SocketAddr, tokio::task::JoinHand
     (addr, task)
 }
 
+async fn spawn_tagged_udp_echo_server(
+    tag: &'static [u8],
+) -> (std::net::SocketAddr, tokio::task::JoinHandle<()>) {
+    let socket = tokio::net::UdpSocket::bind("127.0.0.1:0")
+        .await
+        .expect("bind tagged udp echo socket");
+    let addr = socket.local_addr().expect("tagged udp echo local addr");
+    let task = tokio::spawn(async move {
+        let mut buf = [0_u8; 4096];
+        loop {
+            let (size, peer) = match socket.recv_from(&mut buf).await {
+                Ok(pair) => pair,
+                Err(_) => break,
+            };
+            let mut response = tag.to_vec();
+            response.extend_from_slice(&buf[..size]);
+            let _ = socket.send_to(&response, peer).await;
+        }
+    });
+    (addr, task)
+}
+
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "requires local UDP/TCP socket bind permissions"]
 async fn udp_proxy_roundtrip_works() {
@@ -206,6 +229,57 @@ async fn udp_proxy_roundtrip_works() {
         .expect("server task timed out");
     joined.expect("server task join");
     echo_task.abort();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires local UDP/TCP socket bind permissions"]
+async fn udp_proxy_keeps_same_destination_on_first_resolved_target() {
+    let (primary_addr, primary_task) = spawn_tagged_udp_echo_server(b"primary:").await;
+    let (secondary_addr, secondary_task) = spawn_tagged_udp_echo_server(b"secondary:").await;
+    let (certificates, private_key, certificate) = tls_material();
+    let (server, server_task) =
+        spawn_hysteria_server("hunter2", certificates, private_key, false, None, false).await;
+
+    let mut client_config = ClientConfig::new(server.local_addr().unwrap(), "localhost");
+    client_config.auth = "hunter2".into();
+    client_config.tls.root_certificates = vec![certificate];
+
+    let (client, info) = Client::connect(client_config)
+        .await
+        .expect("connect hysteria client");
+    assert!(info.udp_enabled);
+
+    let udp = client.udp().expect("open proxied udp session");
+
+    let destination = format!("localhost:{}", primary_addr.port());
+    udp.send(b"first", &destination)
+        .await
+        .expect("send first udp payload");
+    let (first_response, _) = udp.receive().await.expect("receive first udp payload");
+    assert_eq!(first_response, b"primary:first");
+
+    let drift_destination = format!("localhost:{}", secondary_addr.port());
+    udp.send(b"second", &destination)
+        .await
+        .expect("send second udp payload");
+    let (second_response, _) = udp.receive().await.expect("receive second udp payload");
+    assert_eq!(second_response, b"primary:second");
+
+    udp.send(b"third", &drift_destination)
+        .await
+        .expect("send third udp payload");
+    let (third_response, _) = udp.receive().await.expect("receive third udp payload");
+    assert_eq!(third_response, b"secondary:third");
+
+    udp.close().await.expect("close udp session");
+    client.close().await.expect("close client");
+    server.close();
+    let joined = tokio::time::timeout(Duration::from_secs(2), server_task)
+        .await
+        .expect("server task timed out");
+    joined.expect("server task join");
+    primary_task.abort();
+    secondary_task.abort();
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -295,6 +369,32 @@ async fn speedtest_server_handler_works() {
         .await
         .expect("speedtest download");
     assert_eq!(download.bytes, 64 * 1024);
+
+    client.close().await.expect("close client");
+    server.close();
+    let joined = tokio::time::timeout(Duration::from_secs(2), server_task)
+        .await
+        .expect("server task timed out");
+    joined.expect("server task join");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires local UDP/TCP socket bind permissions"]
+async fn healthcheck_stream_works_without_speedtest_enabled() {
+    let (certificates, private_key, certificate) = tls_material();
+    let (server, server_task) =
+        spawn_hysteria_server("hunter2", certificates, private_key, true, None, false).await;
+
+    let mut client_config = ClientConfig::new(server.local_addr().unwrap(), "localhost");
+    client_config.auth = "hunter2".into();
+    client_config.tls.root_certificates = vec![certificate];
+
+    let (client, _) = Client::connect(client_config)
+        .await
+        .expect("connect hysteria client");
+    run_client_health_check(&client)
+        .await
+        .expect("healthcheck should succeed");
 
     client.close().await.expect("close client");
     server.close();

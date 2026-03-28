@@ -28,6 +28,9 @@
 
 #include "hev-socks5-session-udp.h"
 
+const char *hev_socks5_addr_into_str (const HevSocks5Addr *addr, char *buf,
+                                      int len);
+
 typedef struct _HevSocks5UDPFrame HevSocks5UDPFrame;
 
 struct _HevSocks5UDPFrame
@@ -194,6 +197,14 @@ udp_recv_handler (void *arg, struct udp_pcb *pcb, struct pbuf *p,
     frame->data = p;
     memset (&frame->node, 0, sizeof (frame->node));
     hev_socks5_addr_from_lwip (&frame->addr, &pcb->local_ip, pcb->local_port);
+
+    if ((self->frames == 0) && LOG_ON ()) {
+        const char *str;
+        char buf[272];
+
+        str = hev_socks5_addr_into_str (&frame->addr, buf, sizeof (buf));
+        LOG_I ("%p socks5 session udp -> %s", self, str);
+    }
 
     if (frame->addr.atype == HEV_SOCKS5_ADDR_TYPE_NAME) {
         self->addr = ip_2_ip4 (&pcb->local_ip)->addr;

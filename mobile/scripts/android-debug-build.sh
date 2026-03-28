@@ -87,11 +87,11 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
-export PATH="${PATH:+$PATH:}$HOME/.cargo/bin"
 export ANDROID_SDK_ROOT="${ANDROID_SDK_ROOT:-/usr/lib/android-sdk}"
 export ANDROID_HOME="${ANDROID_HOME:-$ANDROID_SDK_ROOT}"
 export ANDROID_NDK_HOME="${ANDROID_NDK_HOME:-$ANDROID_SDK_ROOT/ndk/28.2.13676358}"
 export JAVA_HOME="${JAVA_HOME:-/usr/lib/jvm/java-21-openjdk-amd64}"
+export PATH="$ANDROID_HOME/platform-tools:$ANDROID_HOME/cmdline-tools/latest/bin:$HOME/.cargo/bin${PATH:+:$PATH}"
 
 DX_ARGS=(build --android --verbose)
 if [[ "$BUILD_PROFILE" == "release" ]]; then
@@ -174,6 +174,7 @@ fi
 echo "==> Running ./gradlew $GRADLE_TASK"
 (
   cd "$ANDROID_APP_ROOT"
+  chmod +x ./gradlew
   ./gradlew "$GRADLE_TASK"
 )
 

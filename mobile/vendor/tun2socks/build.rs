@@ -1,39 +1,25 @@
-use std::{env, path::PathBuf, process::Command};
+use std::{collections::BTreeMap, env, path::PathBuf, process::Command};
 
-fn target_var(prefix: &str, target: &str) -> String {
-    format!("{}_{}", prefix, target.replace('-', "_"))
-}
-
-fn cargo_target_var(prefix: &str, target: &str) -> String {
-    format!(
-        "{}_{}",
-        prefix,
-        target.to_ascii_uppercase().replace('-', "_")
-    )
-}
+mod toolchain;
 
 fn configure_make(cmd: &mut Command, target: &str) {
-    let cc_key = target_var("CC", target);
-    let ar_key = target_var("AR", target);
-    let linker_key = cargo_target_var("CARGO_TARGET", target) + "_LINKER";
+    let env_map = env::vars().collect::<BTreeMap<_, _>>();
+    let tools = toolchain::resolve_make_tools(target, &env_map);
 
-    let cc = env::var(&cc_key).or_else(|_| env::var(&linker_key));
-    if let Ok(cc) = cc {
+    if let Some(cc) = tools.cc {
         cmd.arg(format!("CC={cc}"));
         cmd.arg(format!("PP={cc}"));
         if target.contains("android") {
             cmd.arg("CFLAGS=-DFD_SET_DEFINED -DSOCKLEN_T_DEFINED");
         }
-        if let Some(parent) = PathBuf::from(&cc).parent() {
-            let strip = parent.join("llvm-strip");
-            if strip.exists() {
-                cmd.arg(format!("STRIP={}", strip.display()));
-            }
-        }
     }
 
-    if let Ok(ar) = env::var(&ar_key) {
+    if let Some(ar) = tools.ar {
         cmd.arg(format!("AR={ar}"));
+    }
+
+    if let Some(strip) = tools.strip {
+        cmd.arg(format!("STRIP={strip}"));
     }
 }
 

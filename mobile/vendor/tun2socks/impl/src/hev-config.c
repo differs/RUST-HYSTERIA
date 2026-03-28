@@ -27,7 +27,9 @@ static char tun_ipv6_address[64];
 static char tun_post_up_script[1024];
 static char tun_pre_down_script[1024];
 
-static HevConfigServer srv;
+static HevConfigServer srv = {
+    .udp_disabled = 0,
+};
 
 static int mapdns_address;
 static int mapdns_port;
@@ -235,8 +237,21 @@ hev_config_parse_socks5 (yaml_document_t *doc, yaml_node_t *base)
     if (pipe && (strcasecmp (pipe, "true") == 0))
         srv.pipeline = 1;
 
-    if (udpm && (strcasecmp (udpm, "udp") == 0))
-        srv.udp_in_udp = 1;
+    if (udpm) {
+        if (strcasecmp (udpm, "udp") == 0) {
+            srv.udp_in_udp = 1;
+            srv.udp_disabled = 0;
+        } else if ((strcasecmp (udpm, "off") == 0) ||
+                   (strcasecmp (udpm, "disable") == 0) ||
+                   (strcasecmp (udpm, "disabled") == 0) ||
+                   (strcasecmp (udpm, "none") == 0)) {
+            srv.udp_in_udp = 0;
+            srv.udp_disabled = 1;
+        } else {
+            srv.udp_in_udp = 0;
+            srv.udp_disabled = 0;
+        }
+    }
 
     if (user && pass) {
         strncpy (_user, user, 256 - 1);

@@ -28,3 +28,7 @@ repository = "https://github.com/heiher/tun2socks"
 [lib]
 name = "tun2socks"
 path = "src/lib.rs"
+
+[[test]]
+name = "toolchain_resolution"
+path = "tests/toolchain_resolution.rs"

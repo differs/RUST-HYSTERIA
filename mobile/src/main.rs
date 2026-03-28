@@ -1,10 +1,11 @@
 mod android_bridge;
+mod dns_proxy;
 mod local_socks;
 mod vpn_tun2socks;
 
 use std::{
     fs::File,
-    io::BufReader,
+    io::{BufRead, BufReader},
     net::{IpAddr, Ipv6Addr, SocketAddr, ToSocketAddrs},
     path::Path,
     sync::{
@@ -16,19 +17,24 @@ use std::{
 };
 
 use anyhow::{Context, Result, anyhow, bail};
+use crate::dns_proxy::{DnsFailureNotifier, DnsProxy, DotUpstream};
 use dioxus::prelude::*;
 use futures_timer::Delay;
 use hysteria_core::{
     Client, ClientConfig as CoreClientConfig, ClientTlsConfig, DEFAULT_KEEP_ALIVE_PERIOD,
-    DEFAULT_MAX_IDLE_TIMEOUT, ObfsConfig, QuicTransportConfig,
+    DEFAULT_MAX_IDLE_TIMEOUT, ObfsConfig, QuicTransportConfig, TransportSnapshot,
+    run_client_health_check,
 };
 use hysteria_extras::speedtest::{Client as SpeedtestClient, SPEEDTEST_ADDR};
-use local_socks::{LocalSocksConfig, serve_socks5};
+use crate::android_bridge::CaCatalog;
+use local_socks::{FatalConnectionNotifier, LocalSocksConfig, serve_socks5};
 use rustls::pki_types::CertificateDer;
 use serde::Deserialize;
 use url::Url;
-use vpn_tun2socks::{Tun2SocksConfig, Tun2SocksHandle};
-use crate::android_bridge::CaCatalog;
+use vpn_tun2socks::{Tun2SocksConfig, Tun2SocksHandle, Tun2SocksUdpMode};
+
+#[cfg(target_os = "android")]
+use std::io::Cursor;
 
 #[cfg(target_os = "android")]
 use jni::{
@@ -46,8 +52,13 @@ const LOCAL_SOCKS_PORT: u16 = 1080;
 const VPN_TUN_NAME: &str = "hy0";
 const VPN_TUN_MTU: u16 = 1500;
 const VPN_TUN_IPV4_ADDR: &str = "10.8.0.2";
-const VPN_TUN_IPV6_ADDR: &str = "fd00::2";
+const VPN_TUN_CONNECT_TIMEOUT_MS: u32 = 15_000;
+const VPN_DNS_SERVER_IP: &str = "1.1.1.1";
+const VPN_DNS_DOT_PORT: u16 = 853;
+const VPN_DNS_PROXY_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_RECONNECT_BACKOFF: Duration = Duration::from_secs(15);
+const HEALTH_PROBE_INTERVAL: Duration = Duration::from_secs(15);
+const HEALTH_PROBE_FAILURE_THRESHOLD: u32 = 2;
 static RUNTIME_CONTROLLER: OnceLock<RuntimeController> = OnceLock::new();
 static ANDROID_RUNTIME_INIT: OnceLock<()> = OnceLock::new();
 
@@ -60,6 +71,95 @@ fn ensure_android_runtime_initialized() {
     ANDROID_RUNTIME_INIT.get_or_init(|| {
         android_bridge::install_socket_protector();
     });
+}
+
+fn managed_vpn_tun_config(local_udp_enabled: bool) -> Tun2SocksConfig {
+    // Managed Android DNS now uses a real public resolver IP so Android does not
+    // depend on a synthetic mapdns endpoint. The local SOCKS/DNS path still
+    // intercepts that destination and resolves over tunneled DoT.
+    Tun2SocksConfig {
+        socks_host: LOCAL_SOCKS_HOST.to_string(),
+        socks_port: LOCAL_SOCKS_PORT,
+        udp_mode: if local_udp_enabled {
+            Tun2SocksUdpMode::Udp
+        } else {
+            Tun2SocksUdpMode::Tcp
+        },
+        tunnel_name: VPN_TUN_NAME.to_string(),
+        mtu: VPN_TUN_MTU,
+        ipv4_addr: VPN_TUN_IPV4_ADDR.to_string(),
+        // The current managed Hysteria nodes do not guarantee IPv6 egress.
+        // Advertising an IPv6 TUN makes Android apps prefer AAAA destinations
+        // that the remote side cannot dial, which surfaces as ERR_CONNECTION_RESET.
+        ipv6_addr: None,
+        connect_timeout_ms: Some(VPN_TUN_CONNECT_TIMEOUT_MS),
+    }
+}
+
+#[cfg(test)]
+fn managed_vpn_dns_servers() -> [&'static str; 1] {
+    [VPN_DNS_SERVER_IP]
+}
+
+fn managed_vpn_dot_upstreams() -> Vec<DotUpstream> {
+    vec![
+        DotUpstream {
+            address: format!("1.1.1.1:{VPN_DNS_DOT_PORT}"),
+            server_name: "cloudflare-dns.com".to_string(),
+        },
+        DotUpstream {
+            address: format!("8.8.8.8:{VPN_DNS_DOT_PORT}"),
+            server_name: "dns.google".to_string(),
+        },
+    ]
+}
+
+fn local_socks_udp_disabled(form: &FormState) -> bool {
+    !form.local_udp_enabled
+}
+
+fn should_run_health_probe(phase: &str) -> bool {
+    phase == "Connected"
+}
+
+fn should_preserve_tun2socks_on_connection_loss(desired_vpn_active: bool) -> bool {
+    desired_vpn_active
+}
+
+fn should_restart_tun2socks_after_reconnect(
+    desired_vpn_active: bool,
+    tun2socks_running: bool,
+) -> bool {
+    desired_vpn_active && !tun2socks_running
+}
+
+fn build_local_socks_config(
+    listen: String,
+    dns_proxy: Option<Arc<DnsProxy>>,
+    form: &FormState,
+) -> LocalSocksConfig {
+    LocalSocksConfig {
+        listen,
+        username: String::new(),
+        password: String::new(),
+        disable_udp: local_socks_udp_disabled(form),
+        dns_proxy,
+    }
+}
+
+fn build_managed_vpn_dns_proxy(
+    client: Client,
+    failure_notifier: Option<DnsFailureNotifier>,
+) -> Result<Arc<DnsProxy>> {
+    let root_certificates = load_system_root_certificates()?;
+    Ok(Arc::new(DnsProxy::new(
+        client,
+        VPN_DNS_SERVER_IP,
+        root_certificates,
+        managed_vpn_dot_upstreams(),
+        VPN_DNS_PROXY_TIMEOUT,
+        failure_notifier,
+    )?))
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -79,6 +179,7 @@ struct FormState {
     quic_max_connection_receive_window: String,
     quic_max_idle_timeout: String,
     quic_keep_alive_period: String,
+    local_udp_enabled: bool,
     quic_disable_path_mtu_discovery: bool,
     insecure_tls: bool,
 }
@@ -108,6 +209,7 @@ impl Default for FormState {
             quic_max_connection_receive_window: String::new(),
             quic_max_idle_timeout: String::new(),
             quic_keep_alive_period: String::new(),
+            local_udp_enabled: true,
             quic_disable_path_mtu_discovery: false,
             insecure_tls: false,
         }
@@ -201,6 +303,9 @@ fn initial_form_state() -> FormState {
             {
                 form.quic_keep_alive_period = value;
             }
+            if let Some(value) = launch.local_udp_enabled {
+                form.local_udp_enabled = value;
+            }
             if let Some(value) = launch.quic_disable_path_mtu_discovery {
                 form.quic_disable_path_mtu_discovery = value;
             }
@@ -231,7 +336,7 @@ fn initial_launch_automation() -> LaunchAutomation {
 
 fn describe_prefill(form: &FormState) -> String {
     format!(
-        "launch prefill: server={} auth={} obfs={} sni={} ca={} pin={} bandwidth.up={} bandwidth.down={} quic.stream={} quic.conn={} idle={} keepAlive={} pmtudOff={} insecure_tls={}",
+        "launch prefill: server={} auth={} obfs={} sni={} ca={} pin={} bandwidth.up={} bandwidth.down={} quic.stream={} quic.conn={} idle={} keepAlive={} udpLocal={} pmtudOff={} insecure_tls={}",
         if form.server.trim().is_empty() {
             "<empty>"
         } else {
@@ -320,6 +425,7 @@ fn describe_prefill(form: &FormState) -> String {
         } else {
             form.quic_keep_alive_period.trim()
         },
+        form.local_udp_enabled,
         form.quic_disable_path_mtu_discovery,
         form.insecure_tls,
     )
@@ -347,6 +453,7 @@ fn has_meaningful_form_prefill(form: &FormState) -> bool {
         || !form.quic_max_connection_receive_window.trim().is_empty()
         || !form.quic_max_idle_timeout.trim().is_empty()
         || !form.quic_keep_alive_period.trim().is_empty()
+        || !form.local_udp_enabled
         || form.quic_disable_path_mtu_discovery
         || form.insecure_tls
 }
@@ -413,12 +520,432 @@ fn current_trust_label(
     parts.join(" + ")
 }
 
-fn button_style_with_state(base: impl AsRef<str>, enabled: bool) -> String {
+type TransportSample = TransportSnapshot;
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct DashboardMetrics {
+    latency: Option<Duration>,
+    tx_total_bytes: u64,
+    rx_total_bytes: u64,
+    tx_rate_bytes: u64,
+    rx_rate_bytes: u64,
+}
+
+impl DashboardMetrics {
+}
+
+fn derive_dashboard_metrics(
+    previous: Option<TransportSample>,
+    current: TransportSample,
+    interval: Duration,
+) -> DashboardMetrics {
+    let seconds = interval.as_secs_f64();
+    let (tx_rate_bytes, rx_rate_bytes) = if seconds <= f64::EPSILON {
+        (0, 0)
+    } else if let Some(previous) = previous {
+        (
+            ((current.tx_bytes.saturating_sub(previous.tx_bytes)) as f64 / seconds).round() as u64,
+            ((current.rx_bytes.saturating_sub(previous.rx_bytes)) as f64 / seconds).round() as u64,
+        )
+    } else {
+        (0, 0)
+    };
+
+    DashboardMetrics {
+        latency: Some(current.rtt),
+        tx_total_bytes: current.tx_bytes,
+        rx_total_bytes: current.rx_bytes,
+        tx_rate_bytes,
+        rx_rate_bytes,
+    }
+}
+
+fn apply_dashboard_metrics(status: &mut UiStatus, metrics: &DashboardMetrics) {
+    status.latency = metrics.latency;
+    status.tx_total_bytes = metrics.tx_total_bytes;
+    status.rx_total_bytes = metrics.rx_total_bytes;
+    status.tx_rate_bytes = metrics.tx_rate_bytes;
+    status.rx_rate_bytes = metrics.rx_rate_bytes;
+}
+
+fn apply_settings_import(current: &FormState, input: &str) -> Result<(FormState, Option<String>)> {
+    let trimmed = input.trim();
+    let (mut imported, warning) = parse_imported_client_document(trimmed)?;
+    if imported.ca_path.trim().is_empty() && !current.ca_path.trim().is_empty() {
+        imported.ca_path = current.ca_path.clone();
+    }
+    if trimmed.starts_with("hy2://") || trimmed.starts_with("hysteria2://") {
+        imported.import_uri = trimmed.to_string();
+    }
+    Ok((imported, warning))
+}
+
+fn show_udp_toggle_in_primary_controls() -> bool {
+    true
+}
+
+fn show_expert_transport_toggles(show_advanced_fields: bool) -> bool {
+    show_advanced_fields
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::android_bridge::{CaCatalog, CaFile};
+
+    fn sample_form() -> FormState {
+        FormState {
+            import_uri: String::new(),
+            server: String::new(),
+            auth: String::new(),
+            obfs_password: String::new(),
+            sni: String::new(),
+            ca_path: String::new(),
+            pin_sha256: String::new(),
+            bandwidth_up: String::new(),
+            bandwidth_down: String::new(),
+            quic_init_stream_receive_window: String::new(),
+            quic_max_stream_receive_window: String::new(),
+            quic_init_connection_receive_window: String::new(),
+            quic_max_connection_receive_window: String::new(),
+            quic_max_idle_timeout: String::new(),
+            quic_keep_alive_period: String::new(),
+            local_udp_enabled: true,
+            quic_disable_path_mtu_discovery: false,
+            insecure_tls: false,
+        }
+    }
+
+    #[test]
+    fn current_trust_label_prefers_catalog_name_for_explicit_ca_path() {
+        let mut form = sample_form();
+        form.ca_path = "/tmp/certs/custom.pem".to_string();
+
+        let catalog = CaCatalog {
+            directory: "/tmp/certs".to_string(),
+            files: vec![CaFile {
+                name: "custom.pem".to_string(),
+                path: form.ca_path.clone(),
+            }],
+        };
+
+        assert_eq!(current_trust_label(&form, &catalog, ""), "custom.pem");
+    }
+
+    #[test]
+    fn current_trust_label_uses_system_trust_store_when_no_overrides_are_set() {
+        let form = sample_form();
+        let catalog = CaCatalog::default();
+
+        assert_eq!(
+            current_trust_label(&form, &catalog, ""),
+            "System trust store"
+        );
+    }
+
+    #[test]
+    fn dashboard_derives_live_rates_and_totals_from_transport_samples() {
+        let metrics = derive_dashboard_metrics(
+            None,
+            TransportSample {
+                rtt: Duration::from_millis(84),
+                tx_bytes: 2_048,
+                rx_bytes: 4_096,
+            },
+            Duration::from_secs(1),
+        );
+        assert_eq!(format_latency(metrics.latency), "84 ms");
+        assert_eq!(format_bytes_per_second(metrics.tx_rate_bytes), "0 B/s");
+        assert_eq!(format_bytes_per_second(metrics.rx_rate_bytes), "0 B/s");
+        assert_eq!(format_total_bytes(metrics.tx_total_bytes), "2.0 KB");
+        assert_eq!(format_total_bytes(metrics.rx_total_bytes), "4.0 KB");
+
+        let metrics = derive_dashboard_metrics(
+            Some(TransportSample {
+                rtt: Duration::from_millis(84),
+                tx_bytes: 2_048,
+                rx_bytes: 4_096,
+            }),
+            TransportSample {
+                rtt: Duration::from_millis(96),
+                tx_bytes: 5_120,
+                rx_bytes: 10_240,
+            },
+            Duration::from_secs(2),
+        );
+        assert_eq!(format_latency(metrics.latency), "96 ms");
+        assert_eq!(format_bytes_per_second(metrics.tx_rate_bytes), "1.5 KB/s");
+        assert_eq!(format_bytes_per_second(metrics.rx_rate_bytes), "3.0 KB/s");
+        assert_eq!(format_total_bytes(metrics.tx_total_bytes), "5.0 KB");
+        assert_eq!(format_total_bytes(metrics.rx_total_bytes), "10.0 KB");
+    }
+
+    #[test]
+    fn settings_import_accepts_hysteria2_uri_and_populates_draft() {
+        let current = sample_form();
+        let (imported, warning) = apply_settings_import(
+            &current,
+            "hysteria2://f36992567ace0abe30188df0cab4b0e9@hi.wedevs.org:12443/?obfs=salamander&obfs-password=ca784b9deaec1b7e9aad52ff8113f875&sni=hi.wedevs.org",
+        )
+        .expect("settings import should succeed");
+
+        assert!(warning.is_none());
+        assert_eq!(imported.server, "hi.wedevs.org:12443");
+        assert_eq!(imported.auth, "f36992567ace0abe30188df0cab4b0e9");
+        assert_eq!(imported.obfs_password, "ca784b9deaec1b7e9aad52ff8113f875");
+        assert_eq!(imported.sni, "hi.wedevs.org");
+        assert_eq!(
+            imported.import_uri,
+            "hysteria2://f36992567ace0abe30188df0cab4b0e9@hi.wedevs.org:12443/?obfs=salamander&obfs-password=ca784b9deaec1b7e9aad52ff8113f875&sni=hi.wedevs.org"
+        );
+    }
+
+    #[test]
+    fn settings_import_preserves_existing_ca_path_when_share_uri_has_no_ca() {
+        let mut current = sample_form();
+        current.ca_path = "/data/user/0/io.hysteria.mobile/files/certs/custom.pem".to_string();
+
+        let (imported, warning) = apply_settings_import(
+            &current,
+            "hysteria2://token@example.com:443/?sni=example.com",
+        )
+        .expect("settings import should succeed");
+
+        assert!(warning.is_none());
+        assert_eq!(imported.ca_path, current.ca_path);
+    }
+
+    #[test]
+    fn system_root_loader_prefers_platform_loader_when_available() {
+        let expected = vec![CertificateDer::from(vec![1_u8, 2, 3, 4])];
+
+        let certs = load_system_root_certificates_with(
+            Some(|| Ok(expected.clone())),
+            || -> Result<Vec<CertificateDer<'static>>> {
+                panic!("native loader should not run when platform certificates are available")
+            },
+        )
+        .expect("platform certificates should satisfy system root loading");
+
+        assert_eq!(certs, expected);
+    }
+
+    #[test]
+    fn managed_vpn_tunnel_defaults_to_ipv4_only() {
+        let config = managed_vpn_tun_config(true);
+
+        assert_eq!(config.ipv6_addr, None);
+    }
+
+    #[test]
+    fn managed_vpn_tunnel_uses_real_ip_dns_without_mapdns() {
+        let yaml = managed_vpn_tun_config(true).render();
+
+        assert!(!yaml.contains("\nmapdns:\n"));
+    }
+
+    #[test]
+    fn managed_vpn_tunnel_raises_connect_timeout_for_store_flows() {
+        let yaml = managed_vpn_tun_config(true).render();
+
+        assert!(yaml.contains("\n  connect-timeout: 15000\n"));
+    }
+
+    #[test]
+    fn managed_vpn_tunnel_enables_udp_relay() {
+        let yaml = managed_vpn_tun_config(true).render();
+
+        assert!(yaml.contains("\n  udp: 'udp'\n"));
+    }
+
+    #[test]
+    fn managed_vpn_tunnel_can_disable_udp_relay() {
+        let yaml = managed_vpn_tun_config(false).render();
+
+        assert!(yaml.contains("\n  udp: 'tcp'\n"));
+    }
+
+    #[test]
+    fn mobile_local_socks_keeps_udp_associate_enabled() {
+        let config = build_local_socks_config("127.0.0.1:1080".to_string(), None, &sample_form());
+
+        assert!(!config.disable_udp);
+        assert!(config.dns_proxy.is_none());
+    }
+
+    #[test]
+    fn mobile_local_socks_can_disable_udp_associate() {
+        let mut form = sample_form();
+        form.local_udp_enabled = false;
+
+        let config = build_local_socks_config("127.0.0.1:1080".to_string(), None, &form);
+
+        assert!(config.disable_udp);
+        assert!(config.dns_proxy.is_none());
+    }
+
+    #[test]
+    fn udp_toggle_stays_visible_even_when_expert_mode_is_off() {
+        assert!(show_udp_toggle_in_primary_controls());
+        assert!(!show_expert_transport_toggles(false));
+        assert!(show_expert_transport_toggles(true));
+    }
+
+    #[test]
+    fn note_dns_failure_increments_only_dns_failure_counter() {
+        let mut metrics = UiMetrics::default();
+        metrics.error_count = 2;
+        metrics.import_count = 1;
+
+        note_dns_failure(&mut metrics);
+        note_dns_failure(&mut metrics);
+
+        assert_eq!(metrics.dns_failure_count, 2);
+        assert_eq!(metrics.error_count, 2);
+        assert_eq!(metrics.import_count, 1);
+    }
+
+    #[test]
+    fn summarize_protocol_reports_udp_ready_when_server_and_local_udp_are_enabled() {
+        let status = UiStatus {
+            remote: "1.2.3.4:443".to_string(),
+            server_udp_supported: true,
+            local_udp_enabled: true,
+            udp_enabled: true,
+            ..UiStatus::default()
+        };
+
+        assert_eq!(summarize_protocol(&status), "QUIC active / UDP relay ready");
+    }
+
+    #[test]
+    fn summarize_protocol_reports_server_udp_unavailable_when_server_disables_udp() {
+        let status = UiStatus {
+            remote: "1.2.3.4:443".to_string(),
+            server_udp_supported: false,
+            local_udp_enabled: true,
+            udp_enabled: false,
+            ..UiStatus::default()
+        };
+
+        assert_eq!(
+            summarize_protocol(&status),
+            "QUIC active / Server UDP unavailable"
+        );
+    }
+
+    #[test]
+    fn summarize_protocol_reports_local_udp_disabled_when_client_blocks_udp() {
+        let status = UiStatus {
+            remote: "1.2.3.4:443".to_string(),
+            server_udp_supported: true,
+            local_udp_enabled: false,
+            udp_enabled: false,
+            ..UiStatus::default()
+        };
+
+        assert_eq!(
+            summarize_protocol(&status),
+            "QUIC active / UDP disabled locally"
+        );
+    }
+
+    #[test]
+    fn managed_vpn_advertises_real_dns_server() {
+        assert_eq!(managed_vpn_dns_servers(), ["1.1.1.1"]);
+    }
+
+    #[test]
+    fn managed_vpn_dns_proxy_matches_public_dns_server_ip() {
+        let dns_server = managed_vpn_dns_servers()[0];
+
+        assert_eq!(
+            crate::dns_proxy::match_dns_proxy_destination(
+                dns_server,
+                &format!("{dns_server}:53")
+            ),
+            Some(crate::dns_proxy::DnsProxyTransport::Plain)
+        );
+        assert_eq!(
+            crate::dns_proxy::match_dns_proxy_destination(
+                dns_server,
+                &format!("{dns_server}:853")
+            ),
+            Some(crate::dns_proxy::DnsProxyTransport::Dot)
+        );
+    }
+
+    #[test]
+    fn managed_vpn_uses_tls_dns_upstreams() {
+        let upstreams = managed_vpn_dot_upstreams();
+
+        assert_eq!(upstreams.len(), 2);
+        assert_eq!(upstreams[0].address, "1.1.1.1:853");
+        assert_eq!(upstreams[0].server_name, "cloudflare-dns.com");
+        assert_eq!(upstreams[1].address, "8.8.8.8:853");
+        assert_eq!(upstreams[1].server_name, "dns.google");
+    }
+
+    #[test]
+    fn disabled_secondary_buttons_keep_readable_text_and_border() {
+        let style = button_style_with_state(button_surface_style(true), true, false);
+
+        assert!(style.contains("color: rgba(243,246,251,0.72);"));
+        assert!(style.contains("border-color: rgba(255,255,255,0.12);"));
+        assert!(!style.contains("opacity: 0.55;"));
+    }
+
+    #[test]
+    fn status_line_layout_keeps_value_right_aligned_with_wrapping_room() {
+        let stylesheet = ui_stylesheet();
+
+        assert!(stylesheet.contains(".status-line-value{flex:1;min-width:0;text-align:right;overflow-wrap:anywhere;word-break:break-word}"));
+        assert!(stylesheet.contains(".status-line-label{flex:0 0 112px;min-width:112px}"));
+    }
+
+    #[test]
+    fn app_shell_uses_multicolor_gradient_background() {
+        let style = app_shell_style(&UiPrefs::default());
+
+        assert!(style.contains("--bg-accent-a:"));
+        assert!(style.contains("--bg-accent-b:"));
+        assert!(style.contains("--bg-accent-c:"));
+        assert!(style.contains("radial-gradient(circle at top left, var(--bg-accent-a) 0%, transparent 42%)"));
+    }
+
+    #[test]
+    fn health_probe_runs_only_for_connected_sessions() {
+        assert!(!should_run_health_probe("Disconnected"));
+        assert!(!should_run_health_probe("Connecting"));
+        assert!(!should_run_health_probe("Reconnecting"));
+        assert!(should_run_health_probe("Connected"));
+    }
+
+    #[test]
+    fn managed_reconnect_preserves_running_tun2socks_runtime() {
+        assert!(should_preserve_tun2socks_on_connection_loss(true));
+        assert!(!should_restart_tun2socks_after_reconnect(true, true));
+    }
+
+    #[test]
+    fn reconnect_starts_tun2socks_when_managed_vpn_shell_is_missing() {
+        assert!(should_restart_tun2socks_after_reconnect(true, false));
+        assert!(!should_restart_tun2socks_after_reconnect(false, false));
+    }
+}
+
+fn button_style_with_state(base: impl AsRef<str>, secondary: bool, enabled: bool) -> String {
     let base = base.as_ref();
     if enabled {
         base.to_string()
+    } else if secondary {
+        format!(
+            "{base}background: rgba(255,255,255,0.05); border-color: rgba(255,255,255,0.12); color: rgba(243,246,251,0.72); box-shadow: none; cursor: default;"
+        )
     } else {
-        format!("{base}opacity: 0.55; filter: saturate(0.7);")
+        format!(
+            "{base}background: rgba(138,180,248,0.38); border-color: rgba(168,199,250,0.18); color: rgba(11,18,32,0.78); box-shadow: none; cursor: default;"
+        )
     }
 }
 
@@ -427,8 +954,15 @@ struct UiStatus {
     phase: String,
     remote: String,
     detail: String,
+    server_udp_supported: bool,
+    local_udp_enabled: bool,
     udp_enabled: bool,
     negotiated_tx: u64,
+    latency: Option<Duration>,
+    tx_total_bytes: u64,
+    rx_total_bytes: u64,
+    tx_rate_bytes: u64,
+    rx_rate_bytes: u64,
     local_socks: String,
     vpn_available: bool,
     vpn_permission_granted: bool,
@@ -443,8 +977,15 @@ impl Default for UiStatus {
             detail:
                 "Import a Linux-compatible config or fill server/auth, then connect. Explicit CA is optional."
                     .to_string(),
+            server_udp_supported: false,
+            local_udp_enabled: true,
             udp_enabled: false,
             negotiated_tx: 0,
+            latency: None,
+            tx_total_bytes: 0,
+            rx_total_bytes: 0,
+            tx_rate_bytes: 0,
+            rx_rate_bytes: 0,
             local_socks: format!("{LOCAL_SOCKS_HOST}:{LOCAL_SOCKS_PORT}"),
             vpn_available: false,
             vpn_permission_granted: false,
@@ -453,6 +994,7 @@ impl Default for UiStatus {
     }
 }
 
+#[cfg_attr(not(target_os = "android"), allow(dead_code))]
 #[derive(Clone, Debug)]
 enum AppCommand {
     Connect(FormState),
@@ -461,17 +1003,19 @@ enum AppCommand {
     Disconnect,
     Speedtest(SpeedDirection),
     RequestVpnPermission,
-    StartVpnShell,
     StopVpnShell,
     ServiceStopped,
     ConnectionClosed { generation: u64, reason: String },
     Reconnect { generation: u64, attempt: u32 },
+    TransportPulse { generation: u64, metrics: DashboardMetrics },
 }
 
 #[derive(Clone, Debug)]
 enum AppEvent {
     Status(UiStatus),
+    Transport(DashboardMetrics),
     Log(String),
+    DnsFailure(String),
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -601,6 +1145,7 @@ struct UiMetrics {
     successful_connections: u32,
     reconnect_count: u32,
     error_count: u32,
+    dns_failure_count: u32,
     import_count: u32,
     latest_download: Option<String>,
     latest_upload: Option<String>,
@@ -748,6 +1293,8 @@ fn controller_thread(
     let mut local_socks_task: Option<tokio::task::JoinHandle<()>> = None;
     let mut tun2socks_task: Option<Tun2SocksHandle> = None;
     let mut close_watch_task: Option<tokio::task::JoinHandle<()>> = None;
+    let mut transport_watch_task: Option<tokio::task::JoinHandle<()>> = None;
+    let mut health_probe_task: Option<tokio::task::JoinHandle<()>> = None;
     let mut current_generation = 0_u64;
     let mut reconnect_form: Option<FormState> = None;
     let mut desired_vpn_active = false;
@@ -765,6 +1312,10 @@ fn controller_thread(
                     &mut local_socks_task,
                     &mut tun2socks_task,
                     &mut close_watch_task,
+                    &mut transport_watch_task,
+                    &mut health_probe_task,
+                    true,
+                    true,
                     true,
                     true,
                 );
@@ -790,11 +1341,13 @@ fn controller_thread(
                             reconnect_snapshot.clone(),
                             client,
                             status,
-                            &mut current_client,
-                            &mut local_socks_task,
-                            &mut close_watch_task,
-                            &mut reconnect_form,
-                        );
+	                            &mut current_client,
+	                            &mut local_socks_task,
+	                            &mut close_watch_task,
+	                            &mut transport_watch_task,
+	                            &mut health_probe_task,
+	                            &mut reconnect_form,
+	                        );
                         connected_status = status;
                     }
                     Err(err) => {
@@ -818,6 +1371,10 @@ fn controller_thread(
                     &mut local_socks_task,
                     &mut tun2socks_task,
                     &mut close_watch_task,
+                    &mut transport_watch_task,
+                    &mut health_probe_task,
+                    true,
+                    true,
                     false,
                     true,
                 );
@@ -873,6 +1430,10 @@ fn controller_thread(
                     &mut local_socks_task,
                     &mut tun2socks_task,
                     &mut close_watch_task,
+                    &mut transport_watch_task,
+                    &mut health_probe_task,
+                    true,
+                    true,
                     false,
                     true,
                 );
@@ -893,6 +1454,7 @@ fn controller_thread(
                 let reconnect_snapshot = form.clone();
                 match runtime.block_on(connect_client(form)) {
                     Ok((client, status)) => {
+                        let local_udp_enabled = reconnect_snapshot.local_udp_enabled;
                         let mut status = activate_connection(
                             runtime.handle().clone(),
                             tx_cmd.clone(),
@@ -901,13 +1463,15 @@ fn controller_thread(
                             reconnect_snapshot,
                             client,
                             status,
-                            &mut current_client,
-                            &mut local_socks_task,
-                            &mut close_watch_task,
-                            &mut reconnect_form,
+	                            &mut current_client,
+	                            &mut local_socks_task,
+	                            &mut close_watch_task,
+	                            &mut transport_watch_task,
+	                            &mut health_probe_task,
+	                            &mut reconnect_form,
                         );
                         stop_vpn_runtime(&tx_evt, &mut tun2socks_task, false);
-                        match start_vpn_runtime(&tx_evt, false) {
+                        match start_vpn_runtime(&tx_evt, false, local_udp_enabled) {
                             Ok(handle) => {
                                 tun2socks_task = Some(handle);
                                 status.detail = "Android VpnService now owns the managed runtime: TUN -> tun2socks -> local SOCKS -> hysteria-core".to_string();
@@ -953,6 +1517,10 @@ fn controller_thread(
                     &mut local_socks_task,
                     &mut tun2socks_task,
                     &mut close_watch_task,
+                    &mut transport_watch_task,
+                    &mut health_probe_task,
+                    true,
+                    true,
                     true,
                     true,
                 );
@@ -1010,39 +1578,6 @@ fn controller_thread(
                     )));
                 }
             },
-            AppCommand::StartVpnShell => {
-                if current_client.is_none() {
-                    let _ = tx_evt.send(AppEvent::Log(
-                        "connect the client first so the local SOCKS runtime exists".to_string(),
-                    ));
-                    continue;
-                }
-
-                if local_socks_task.is_none() {
-                    let _ = tx_evt.send(AppEvent::Log(
-                        "local SOCKS runtime is not running yet".to_string(),
-                    ));
-                    continue;
-                }
-
-                desired_vpn_active = true;
-                stop_vpn_runtime(&tx_evt, &mut tun2socks_task, false);
-                match start_vpn_runtime(&tx_evt, true) {
-                    Ok(handle) => {
-                        tun2socks_task = Some(handle);
-                        connected_status.detail =
-                            "Android system VPN started: TUN -> tun2socks -> local SOCKS -> hysteria-core"
-                                .to_string();
-                    }
-                    Err(err) => {
-                        let _ =
-                            tx_evt.send(AppEvent::Log(format!("start system VPN failed: {err:#}")));
-                        connected_status.detail = format!("start system VPN failed: {err}");
-                    }
-                }
-                connected_status = with_vpn_state(connected_status);
-                let _ = tx_evt.send(AppEvent::Status(connected_status.clone()));
-            }
             AppCommand::StopVpnShell => {
                 desired_vpn_active = false;
                 stop_vpn_runtime(&tx_evt, &mut tun2socks_task, true);
@@ -1061,6 +1596,10 @@ fn controller_thread(
                     &mut local_socks_task,
                     &mut tun2socks_task,
                     &mut close_watch_task,
+                    &mut transport_watch_task,
+                    &mut health_probe_task,
+                    true,
+                    true,
                     false,
                     true,
                 );
@@ -1076,6 +1615,8 @@ fn controller_thread(
                 }
 
                 let restart_vpn = desired_vpn_active;
+                let preserve_tun2socks =
+                    should_preserve_tun2socks_on_connection_loss(restart_vpn);
                 let _ = tx_evt.send(AppEvent::Log(format!(
                     "connection closed unexpectedly: {reason}"
                 )));
@@ -1086,6 +1627,10 @@ fn controller_thread(
                     &mut local_socks_task,
                     &mut tun2socks_task,
                     &mut close_watch_task,
+                    &mut transport_watch_task,
+                    &mut health_probe_task,
+                    true,
+                    !preserve_tun2socks,
                     false,
                     false,
                 );
@@ -1094,13 +1639,20 @@ fn controller_thread(
                     remote: connected_status.remote.clone(),
                     detail: if restart_vpn {
                         format!(
-                            "Connection lost: {reason}. Reconnecting soon and restoring Android VPN..."
+                            "Connection lost: {reason}. Reconnecting soon while keeping Android VPN shell alive..."
                         )
                     } else {
                         format!("Connection lost: {reason}. Reconnecting soon...")
                     },
+                    server_udp_supported: connected_status.server_udp_supported,
+                    local_udp_enabled: connected_status.local_udp_enabled,
                     udp_enabled: connected_status.udp_enabled,
                     negotiated_tx: connected_status.negotiated_tx,
+                    latency: connected_status.latency,
+                    tx_total_bytes: connected_status.tx_total_bytes,
+                    rx_total_bytes: connected_status.rx_total_bytes,
+                    tx_rate_bytes: 0,
+                    rx_rate_bytes: 0,
                     local_socks: connected_status.local_socks.clone(),
                     ..UiStatus::default()
                 });
@@ -1126,8 +1678,15 @@ fn controller_thread(
                         attempt + 1,
                         form.server.trim()
                     ),
+                    server_udp_supported: connected_status.server_udp_supported,
+                    local_udp_enabled: connected_status.local_udp_enabled,
                     udp_enabled: connected_status.udp_enabled,
                     negotiated_tx: connected_status.negotiated_tx,
+                    latency: connected_status.latency,
+                    tx_total_bytes: connected_status.tx_total_bytes,
+                    rx_total_bytes: connected_status.rx_total_bytes,
+                    tx_rate_bytes: 0,
+                    rx_rate_bytes: 0,
                     local_socks: connected_status.local_socks.clone(),
                     ..UiStatus::default()
                 })));
@@ -1139,6 +1698,7 @@ fn controller_thread(
 
                 match runtime.block_on(connect_client(form.clone())) {
                     Ok((client, status)) => {
+                        let local_udp_enabled = form.local_udp_enabled;
                         let status = activate_connection(
                             runtime.handle().clone(),
                             tx_cmd.clone(),
@@ -1150,15 +1710,19 @@ fn controller_thread(
                             &mut current_client,
                             &mut local_socks_task,
                             &mut close_watch_task,
+                            &mut transport_watch_task,
+                            &mut health_probe_task,
                             &mut reconnect_form,
                         );
                         connected_status = status;
                         let _ =
                             tx_evt.send(AppEvent::Log("automatic reconnect succeeded".to_string()));
 
-                        if desired_vpn_active {
-                            stop_vpn_runtime(&tx_evt, &mut tun2socks_task, false);
-                            match start_vpn_runtime(&tx_evt, false) {
+                        if should_restart_tun2socks_after_reconnect(
+                            desired_vpn_active,
+                            tun2socks_task.is_some(),
+                        ) {
+                            match start_vpn_runtime(&tx_evt, false, local_udp_enabled) {
                                 Ok(handle) => {
                                     tun2socks_task = Some(handle);
                                     connected_status.detail = "Automatic reconnect restored Android system VPN: TUN -> tun2socks -> local SOCKS -> hysteria-core".to_string();
@@ -1172,6 +1736,14 @@ fn controller_thread(
                                     );
                                 }
                             }
+                        } else if desired_vpn_active {
+                            let _ = tx_evt.send(AppEvent::Log(
+                                "automatic reconnect preserved Android VPN shell and local DNS path"
+                                    .to_string(),
+                            ));
+                            connected_status.detail =
+                                "Automatic reconnect preserved Android system VPN shell and local DNS path"
+                                    .to_string();
                             connected_status = with_vpn_state(connected_status);
                             let _ = tx_evt.send(AppEvent::Status(connected_status.clone()));
                         }
@@ -1191,8 +1763,15 @@ fn controller_thread(
                                 attempt + 1,
                                 delay.as_secs()
                             ),
+                            server_udp_supported: connected_status.server_udp_supported,
+                            local_udp_enabled: connected_status.local_udp_enabled,
                             udp_enabled: connected_status.udp_enabled,
                             negotiated_tx: connected_status.negotiated_tx,
+                            latency: connected_status.latency,
+                            tx_total_bytes: connected_status.tx_total_bytes,
+                            rx_total_bytes: connected_status.rx_total_bytes,
+                            tx_rate_bytes: 0,
+                            rx_rate_bytes: 0,
                             local_socks: connected_status.local_socks.clone(),
                             ..UiStatus::default()
                         });
@@ -1205,6 +1784,16 @@ fn controller_thread(
                         );
                     }
                 }
+            }
+            AppCommand::TransportPulse {
+                generation,
+                metrics,
+            } => {
+                if generation != current_generation || current_client.is_none() {
+                    continue;
+                }
+                apply_dashboard_metrics(&mut connected_status, &metrics);
+                let _ = tx_evt.send(AppEvent::Transport(metrics));
             }
         }
     }
@@ -1221,24 +1810,53 @@ fn activate_connection(
     current_client: &mut Option<Client>,
     local_socks_task: &mut Option<tokio::task::JoinHandle<()>>,
     close_watch_task: &mut Option<tokio::task::JoinHandle<()>>,
+    transport_watch_task: &mut Option<tokio::task::JoinHandle<()>>,
+    health_probe_task: &mut Option<tokio::task::JoinHandle<()>>,
     reconnect_form: &mut Option<FormState>,
 ) -> UiStatus {
+    let local_udp_enabled = reconnect_snapshot.local_udp_enabled;
     let socks_listen = format!("{LOCAL_SOCKS_HOST}:{LOCAL_SOCKS_PORT}");
+    let close_watch_handle = runtime_handle.clone();
+    let transport_watch_handle = runtime_handle.clone();
+    let transport_watch_tx = tx_cmd.clone();
     *local_socks_task = Some(spawn_local_socks(
         runtime_handle.clone(),
+        transport_watch_tx.clone(),
         tx_evt.clone(),
         client.clone(),
         socks_listen.clone(),
+        generation,
+        local_udp_enabled,
     ));
     *close_watch_task = Some(spawn_connection_close_watcher(
-        runtime_handle,
+        close_watch_handle,
         tx_cmd,
         client.clone(),
         generation,
     ));
+    *transport_watch_task = Some(spawn_transport_metrics_watcher(
+        transport_watch_handle,
+        transport_watch_tx.clone(),
+        client.clone(),
+        generation,
+    ));
+    *health_probe_task = if should_run_health_probe(&status.phase) {
+        Some(spawn_health_probe_watcher(
+            runtime_handle.clone(),
+            transport_watch_tx,
+            client.clone(),
+            generation,
+        ))
+    } else {
+        None
+    };
 
     let mut status = with_vpn_state(status);
     status.local_socks = socks_listen.clone();
+    apply_dashboard_metrics(
+        &mut status,
+        &derive_dashboard_metrics(None, client.transport_snapshot(), Duration::from_secs(1)),
+    );
     *reconnect_form = Some(reconnect_snapshot);
     *current_client = Some(client);
 
@@ -1261,16 +1879,30 @@ fn stop_active_session(
     local_socks_task: &mut Option<tokio::task::JoinHandle<()>>,
     tun2socks_task: &mut Option<Tun2SocksHandle>,
     close_watch_task: &mut Option<tokio::task::JoinHandle<()>>,
+    transport_watch_task: &mut Option<tokio::task::JoinHandle<()>>,
+    health_probe_task: &mut Option<tokio::task::JoinHandle<()>>,
+    stop_local_socks_runtime: bool,
+    stop_tun2socks_runtime: bool,
     stop_service: bool,
     gracefully_close_client: bool,
 ) {
     if let Some(task) = close_watch_task.take() {
         task.abort();
     }
+    if let Some(task) = transport_watch_task.take() {
+        task.abort();
+    }
+    if let Some(task) = health_probe_task.take() {
+        task.abort();
+    }
 
-    stop_vpn_runtime(tx_evt, tun2socks_task, stop_service);
+    if stop_tun2socks_runtime {
+        stop_vpn_runtime(tx_evt, tun2socks_task, stop_service);
+    }
 
-    if let Some(task) = local_socks_task.take() {
+    if stop_local_socks_runtime
+        && let Some(task) = local_socks_task.take()
+    {
         task.abort();
     }
 
@@ -1300,6 +1932,57 @@ fn spawn_connection_close_watcher(
     })
 }
 
+fn spawn_transport_metrics_watcher(
+    handle: tokio::runtime::Handle,
+    tx_cmd: Sender<AppCommand>,
+    client: Client,
+    generation: u64,
+) -> tokio::task::JoinHandle<()> {
+    handle.spawn(async move {
+        let mut previous = None;
+        loop {
+            let current = client.transport_snapshot();
+            let metrics =
+                derive_dashboard_metrics(previous, current, Duration::from_secs(1));
+            if tx_cmd
+                .send(AppCommand::TransportPulse { generation, metrics })
+                .is_err()
+            {
+                break;
+            }
+            previous = Some(current);
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        }
+    })
+}
+
+fn spawn_health_probe_watcher(
+    handle: tokio::runtime::Handle,
+    tx_cmd: Sender<AppCommand>,
+    client: Client,
+    generation: u64,
+) -> tokio::task::JoinHandle<()> {
+    handle.spawn(async move {
+        let mut failures = 0_u32;
+        loop {
+            tokio::time::sleep(HEALTH_PROBE_INTERVAL).await;
+            match run_client_health_check(&client).await {
+                Ok(_) => failures = 0,
+                Err(err) => {
+                    failures = failures.saturating_add(1);
+                    if failures >= HEALTH_PROBE_FAILURE_THRESHOLD {
+                        let _ = tx_cmd.send(AppCommand::ConnectionClosed {
+                            generation,
+                            reason: format!("health probe failed: {err}"),
+                        });
+                        break;
+                    }
+                }
+            }
+        }
+    })
+}
+
 fn reconnect_delay(attempt: u32) -> Duration {
     let seconds = 1_u64
         .checked_shl(attempt.min(4))
@@ -1326,6 +2009,7 @@ fn schedule_reconnect(
 fn start_vpn_runtime(
     tx_evt: &Sender<AppEvent>,
     request_service_start: bool,
+    local_udp_enabled: bool,
 ) -> Result<Tun2SocksHandle> {
     if request_service_start {
         android_bridge::start_vpn_service(LOCAL_SOCKS_HOST, i32::from(LOCAL_SOCKS_PORT))
@@ -1342,17 +2026,10 @@ fn start_vpn_runtime(
             let tun_fd = android_bridge::take_tun_fd().context("failed to fetch TUN fd")?;
             if tun_fd >= 0 {
                 let handle = vpn_tun2socks::spawn(
-                    Tun2SocksConfig {
-                        socks_host: LOCAL_SOCKS_HOST.to_string(),
-                        socks_port: LOCAL_SOCKS_PORT,
-                        tunnel_name: VPN_TUN_NAME.to_string(),
-                        mtu: VPN_TUN_MTU,
-                        ipv4_addr: VPN_TUN_IPV4_ADDR.to_string(),
-                        ipv6_addr: Some(VPN_TUN_IPV6_ADDR.to_string()),
-                    },
+                    managed_vpn_tun_config(local_udp_enabled),
                     tun_fd,
                 )
-                .context("failed to spawn tun2socks runtime")?;
+                    .context("failed to spawn tun2socks runtime")?;
                 let _ = tx_evt.send(AppEvent::Log(
                     "Android system VPN started: TUN -> tun2socks -> local SOCKS -> hysteria-core"
                         .to_string(),
@@ -1405,18 +2082,47 @@ fn stop_vpn_runtime(
 
 fn spawn_local_socks(
     handle: tokio::runtime::Handle,
+    tx_cmd: Sender<AppCommand>,
     tx_evt: Sender<AppEvent>,
     client: Client,
     listen: String,
+    generation: u64,
+    local_udp_enabled: bool,
 ) -> tokio::task::JoinHandle<()> {
     handle.spawn(async move {
-        let config = LocalSocksConfig {
-            listen: listen.clone(),
-            username: String::new(),
-            password: String::new(),
-            disable_udp: false,
+        let fatal_notifier: FatalConnectionNotifier = Arc::new({
+            let tx_cmd = tx_cmd.clone();
+            move |reason: String| {
+                let _ = tx_cmd.send(AppCommand::ConnectionClosed { generation, reason });
+            }
+        });
+        let dns_failure_notifier: DnsFailureNotifier = Arc::new({
+            let tx_evt = tx_evt.clone();
+            move |reason: String| {
+                let _ = tx_evt.send(AppEvent::DnsFailure(reason));
+            }
+        });
+        let dns_proxy = match build_managed_vpn_dns_proxy(
+            client.clone(),
+            Some(dns_failure_notifier),
+        ) {
+            Ok(proxy) => Some(proxy),
+            Err(err) => {
+                let _ = tx_evt.send(AppEvent::Log(format!(
+                    "managed VPN DNS proxy init failed: {err:#}"
+                )));
+                None
+            }
         };
-        if let Err(err) = serve_socks5(config, client).await {
+        let config = build_local_socks_config(
+            listen.clone(),
+            dns_proxy,
+            &FormState {
+                local_udp_enabled,
+                ..FormState::default()
+            },
+        );
+        if let Err(err) = serve_socks5(config, client, Some(fatal_notifier)).await {
             let _ = tx_evt.send(AppEvent::Log(format!(
                 "local SOCKS runtime stopped: {err:#}"
             )));
@@ -1498,6 +2204,7 @@ pub extern "system" fn Java_dev_dioxus_main_HysteriaVpnService_nativeStartManage
     quic_max_connection_receive_window: JString<'_>,
     quic_max_idle_timeout: JString<'_>,
     quic_keep_alive_period: JString<'_>,
+    local_udp_enabled: jboolean,
     quic_disable_path_mtu_discovery: jboolean,
     insecure_tls: jboolean,
     _restore_vpn: jboolean,
@@ -1535,6 +2242,7 @@ pub extern "system" fn Java_dev_dioxus_main_HysteriaVpnService_nativeStartManage
                 )?,
                 quic_max_idle_timeout: jstring_to_string(env, &quic_max_idle_timeout)?,
                 quic_keep_alive_period: jstring_to_string(env, &quic_keep_alive_period)?,
+                local_udp_enabled,
                 quic_disable_path_mtu_discovery,
                 insecure_tls,
             }));
@@ -1573,12 +2281,13 @@ fn App() -> Element {
     let mut prefs = use_signal(UiPrefs::default);
     let mut active_tab = use_signal(|| AppTab::Home);
     let mut settings_return_tab = use_signal(|| AppTab::Home);
+    let mut diagnostics_expanded = use_signal(|| false);
     let mut node_filter = use_signal(|| NodeFilter::All);
     let mut node_search = use_signal(String::new);
     let mut ca_catalog = use_signal(|| android_bridge::query_ca_catalog().unwrap_or_default());
     let mut live_tick = use_signal(|| 0_u64);
     let mut auto_connect_after_vpn_permission = use_signal(|| false);
-    let imported_config_name = use_signal(String::new);
+    let mut imported_config_name = use_signal(String::new);
     let imported_cert_name = use_signal(String::new);
     let mut logs = use_signal(|| {
         let vpn_note = android_bridge::availability_message(
@@ -1612,9 +2321,16 @@ fn App() -> Element {
                             record_status_transition(&mut metrics, &previous, &next);
                             status.set(next);
                         }
+                        AppEvent::Transport(next) => {
+                            status.with_mut(|current| apply_dashboard_metrics(current, &next));
+                        }
                         AppEvent::Log(message) => {
                             record_log_metrics(&mut metrics, &message);
                             append_log(&mut logs, message);
+                        }
+                        AppEvent::DnsFailure(reason) => {
+                            record_dns_failure(&mut metrics);
+                            append_log(&mut logs, format!("DNS failure: {reason}"));
                         }
                     }
                 }
@@ -1886,6 +2602,7 @@ fn App() -> Element {
     let metrics_snapshot = metrics();
     let prefs_snapshot = prefs();
     let active_tab_snapshot = active_tab();
+    let diagnostics_expanded_snapshot = diagnostics_expanded();
     let node_filter_snapshot = node_filter();
     let node_search_snapshot = node_search();
     let ca_catalog_snapshot = ca_catalog();
@@ -1914,10 +2631,13 @@ fn App() -> Element {
         ),
         AppTab::Settings => (
             "Settings".to_string(),
-            "Connection, Android VPN, and appearance.".to_string(),
+            "Import, configure, and inspect the mobile runtime.".to_string(),
         ),
     };
-    let topbar_action_label: Option<&'static str> = None;
+    let topbar_action_label: Option<&'static str> = Some(match active_tab_snapshot {
+        AppTab::Settings => "Back",
+        _ => "Settings",
+    });
     let connection_tone = phase_tone(&status_snapshot.phase);
     let can_load_saved = saved_profile_snapshot.is_some();
     let latest_download = metrics_snapshot
@@ -1946,7 +2666,7 @@ fn App() -> Element {
         .filter(|card| node_filter_matches(node_filter_snapshot, card.kind))
         .filter(|card| node_search_matches(&node_search_snapshot, card))
         .collect();
-    let home_recent_logs: Vec<LogEntry> = log_items.iter().take(4).cloned().collect();
+    let _home_recent_logs: Vec<LogEntry> = log_items.iter().take(4).cloned().collect();
     let stats_recent_logs: Vec<LogEntry> = log_items.iter().take(8).cloned().collect();
     let _vpn_action_label = vpn_action_label(&status_snapshot);
     let health_score = connection_health_score(&metrics_snapshot, &status_snapshot);
@@ -1966,6 +2686,18 @@ fn App() -> Element {
         &ca_catalog_snapshot,
         &imported_cert_name_snapshot,
     );
+    let current_node_label = if !imported_config_name_snapshot.trim().is_empty() {
+        imported_config_name_snapshot.clone()
+    } else if !form_snapshot.server.trim().is_empty() {
+        summarize_endpoint(&form_snapshot.server)
+    } else {
+        "No node configured".to_string()
+    };
+    let upload_rate_label = format_bytes_per_second(status_snapshot.tx_rate_bytes);
+    let download_rate_label = format_bytes_per_second(status_snapshot.rx_rate_bytes);
+    let upload_total_label = format_total_bytes(status_snapshot.tx_total_bytes);
+    let download_total_label = format_total_bytes(status_snapshot.rx_total_bytes);
+    let latency_label = format_latency(status_snapshot.latency);
     let primary_action_label = if should_offer_disconnect(&status_snapshot.phase) {
         "Disconnect"
     } else if !status_snapshot.vpn_permission_granted {
@@ -1977,13 +2709,20 @@ fn App() -> Element {
     rsx! {
         div {
             style: app_shell_style(&prefs_snapshot),
+            div { dangerous_inner_html: format!("<style>{}</style>", ui_stylesheet()) }
             div {
                 style: "position: relative; z-index: 1; width: min(100%, 560px); margin: 0 auto; display: flex; flex-direction: column; gap: 18px;",
                 TopBar {
                     title: page_title,
                     subtitle: page_subtitle,
                     action_label: topbar_action_label,
-                    on_action: move |_| {},
+                    on_action: move |_| {
+                        if active_tab() == AppTab::Settings {
+                            active_tab.set(AppTab::Home);
+                        } else {
+                            active_tab.set(AppTab::Settings);
+                        }
+                    },
                 }
 
                 match active_tab_snapshot {
@@ -1993,121 +2732,99 @@ fn App() -> Element {
                             section {
                                 style: status_card_style(connection_tone, &prefs_snapshot),
                                 div {
-                                    style: "display: flex; justify-content: space-between; gap: 16px; align-items: flex-start; flex-wrap: wrap;",
+                                    class: "row between gap-16 start wrap",
                                     div {
-                                        style: "display: flex; flex-direction: column; gap: 6px;",
+                                        class: "col gap-6",
                                         h1 {
-                                            style: "margin: 0; font-size: 24px; line-height: 1.15; font-weight: 600;",
+                                            class: "m-0 text-2xl fw-600",
+                                            style: "line-height: 1.15;",
                                             "{status_snapshot.phase}"
                                         }
                                         p {
-                                            style: "margin: 0; color: #a8b3c7; font-size: 14px; line-height: 1.5;",
+                                            class: "m-0 text-base c-secondary",
                                             "{status_snapshot.detail}"
                                         }
                                     }
                                     div {
-                                        style: "display: flex; flex-wrap: wrap; gap: 8px; justify-content: flex-end;",
+                                        class: "row wrap gap-8 end-x",
                                         StatusPill { label: format!("VPN {}", vpn_badge_label(&status_snapshot)), tone: if status_snapshot.vpn_active { AccentTone::Positive } else { AccentTone::Neutral } }
-                                        StatusPill { label: summarize_protocol(&status_snapshot), tone: if status_snapshot.udp_enabled { AccentTone::Accent } else { AccentTone::Neutral } }
+                                        StatusPill { label: summarize_protocol(&status_snapshot), tone: udp_status_tone(&status_snapshot) }
                                     }
                                 }
 
                                 div {
-                                    style: "display: flex; flex-direction: column; gap: 0; border-radius: 18px; background: rgba(255,255,255,0.03); border: 1px solid rgba(255,255,255,0.06); padding: 4px 16px;",
+                                    style: "display: flex; justify-content: center; padding: 8px 0 2px;",
+                                    button {
+                                        style: button_style_with_state(
+                                            "width: 196px; height: 196px; border: 1px solid rgba(255,255,255,0.08); border-radius: 999px; background: radial-gradient(circle at top, rgba(82,136,255,0.22), rgba(255,255,255,0.03)); color: #f3f7ff; font-size: 28px; font-weight: 700; letter-spacing: -0.03em; box-shadow: 0 18px 54px rgba(0,0,0,0.28);",
+                                            false,
+                                            can_connect || should_offer_disconnect(&status_snapshot.phase),
+                                        ),
+                                        disabled: !can_connect && !should_offer_disconnect(&status_snapshot.phase),
+                                        onclick: {
+                                            let controller = controller.clone();
+                                            let snapshot = form();
+                                            move |_| {
+                                                if should_offer_disconnect(&status_snapshot.phase) {
+                                                    auto_connect_after_vpn_permission.set(false);
+                                                    controller.send(AppCommand::Disconnect);
+                                                } else if !has_required_connection_fields(&snapshot) {
+                                                    append_log(&mut logs, "import a valid config before connecting".to_string());
+                                                    active_tab.set(AppTab::Settings);
+                                                } else if !status_snapshot.vpn_permission_granted {
+                                                    auto_connect_after_vpn_permission.set(true);
+                                                    controller.send(AppCommand::RequestVpnPermission);
+                                                } else {
+                                                    controller.send(AppCommand::StartManagedVpn(snapshot.clone()));
+                                                }
+                                            }
+                                        },
+                                        "{primary_action_label}"
+                                    }
+                                }
+
+                                div {
+                                    class: "grid-2 gap-12",
+                                    MetricCard {
+                                        eyebrow: "Upload",
+                                        value: upload_rate_label.clone(),
+                                        detail: "Real-time upstream traffic through the active tunnel.".to_string(),
+                                        tone: AccentTone::Accent,
+                                    }
+                                    MetricCard {
+                                        eyebrow: "Download",
+                                        value: download_rate_label.clone(),
+                                        detail: "Real-time downstream traffic through the active tunnel.".to_string(),
+                                        tone: AccentTone::Positive,
+                                    }
+                                    MetricCard {
+                                        eyebrow: "Uploaded",
+                                        value: upload_total_label.clone(),
+                                        detail: "Cumulative bytes sent over the active QUIC connection.".to_string(),
+                                        tone: AccentTone::Neutral,
+                                    }
+                                    MetricCard {
+                                        eyebrow: "Downloaded",
+                                        value: download_total_label.clone(),
+                                        detail: "Cumulative bytes received over the active QUIC connection.".to_string(),
+                                        tone: AccentTone::Neutral,
+                                    }
+                                }
+
+                                div {
+                                    class: "info-box col",
+                                    StatusLine { label: "Node", value: current_node_label }
                                     StatusLine { label: "Config", value: current_config_label }
                                     StatusLine { label: "Endpoint", value: config_value_or_empty(&form_snapshot.server) }
-                                    StatusLine { label: "Trust", value: current_trust_label }
                                     StatusLine { label: "Remote", value: display_or_dash(&status_snapshot.remote) }
+                                    StatusLine { label: "Latency", value: latency_label.clone() }
                                     StatusLine { label: "Session", value: online_duration.clone() }
-                                    StatusLine { label: "Last connected", value: last_connected.clone() }
-                                }
-                            }
-
-                            section {
-                                style: panel_style(&prefs_snapshot),
-                                SectionHeader {
-                                    title: "Import",
-                                    subtitle: "Load a Linux-compatible client config or share URI. Explicit CA files only matter when you want to override system trust.".to_string(),
-                                }
-                                div {
-                                    style: format!(
-                                        "display: grid; grid-template-columns: {}; gap: 12px;",
-                                        if prefs_snapshot.show_advanced_fields {
-                                            "repeat(2, minmax(0, 1fr))"
-                                        } else {
-                                            "minmax(0, 1fr)"
-                                        }
-                                    ),
-                                    PrimaryButton {
-                                        label: "Import Config",
-                                        disabled: false,
-                                        secondary: true,
-                                        onclick: move |_| match android_bridge::request_config_import() {
-                                            Ok(_) => append_log(&mut logs, "opened Android config picker".to_string()),
-                                            Err(err) => append_log(&mut logs, format!("open config picker failed: {err:#}")),
-                                        },
-                                    }
-                                    if prefs_snapshot.show_advanced_fields {
-                                        PrimaryButton {
-                                            label: "Import Cert",
-                                            disabled: false,
-                                            secondary: true,
-                                            onclick: move |_| match android_bridge::request_ca_import() {
-                                                Ok(_) => append_log(&mut logs, "opened Android certificate picker".to_string()),
-                                                Err(err) => append_log(&mut logs, format!("open certificate picker failed: {err:#}")),
-                                            },
-                                        }
-                                    }
-                                }
-                                if prefs_snapshot.show_advanced_fields && !ca_catalog_snapshot.directory.trim().is_empty() {
-                                    p {
-                                        style: "margin: 14px 0 0; color: #6e7b91; font-size: 12px; line-height: 1.5;",
-                                        "App CA directory: {ca_catalog_snapshot.directory}"
-                                    }
-                                } else if !prefs_snapshot.show_advanced_fields {
-                                    p {
-                                        style: "margin: 14px 0 0; color: #6e7b91; font-size: 12px; line-height: 1.5;",
-                                        "Need an explicit CA file or TLS debugging switches? Open Expert mode in Active Draft."
-                                    }
-                                }
-                            }
-
-                            section {
-                                style: panel_style(&prefs_snapshot),
-                                SectionHeader {
-                                    title: "Connection",
-                                    subtitle: if !status_snapshot.vpn_permission_granted {
-                                        "The first tap requests Android VPN permission, then the app continues connecting automatically.".to_string()
-                                    } else {
-                                        "Connect starts the managed Android VPN runtime and routes traffic through hysteria-core.".to_string()
-                                    },
-                                }
-                                button {
-                                    style: button_style_with_state(button_surface_style(false), can_connect || should_offer_disconnect(&status_snapshot.phase)),
-                                    disabled: !can_connect && !should_offer_disconnect(&status_snapshot.phase),
-                                    onclick: {
-                                        let controller = controller.clone();
-                                        let snapshot = form();
-                                        move |_| {
-                                            if should_offer_disconnect(&status_snapshot.phase) {
-                                                auto_connect_after_vpn_permission.set(false);
-                                                controller.send(AppCommand::Disconnect);
-                                            } else if !has_required_connection_fields(&snapshot) {
-                                                append_log(&mut logs, "import a valid config before connecting".to_string());
-                                            } else if !status_snapshot.vpn_permission_granted {
-                                                auto_connect_after_vpn_permission.set(true);
-                                                controller.send(AppCommand::RequestVpnPermission);
-                                            } else {
-                                                controller.send(AppCommand::StartManagedVpn(snapshot.clone()));
-                                            }
-                                        }
-                                    },
-                                    "{primary_action_label}"
+                                    StatusLine { label: "Trust", value: current_trust_label }
                                 }
                                 if !can_connect && !should_offer_disconnect(&status_snapshot.phase) {
                                     p {
                                         style: "margin: 14px 0 0; color: #fca5a5; font-size: 13px; line-height: 1.5;",
-                                        "Import a valid config first. A usable profile must resolve to both server and auth."
+                                        "还没有可用配置。点右上角进入 Settings，粘贴 hysteria2:// 链接或手动填写服务器和认证信息。"
                                     }
                                 }
                             }
@@ -2115,24 +2832,16 @@ fn App() -> Element {
                             section {
                                 style: panel_style(&prefs_snapshot),
                                 SectionHeader {
-                                    title: "Recent Activity",
-                                    subtitle: "Newest runtime events first.".to_string(),
+                                    title: "Connection Summary",
+                                    subtitle: "Home keeps the main path minimal: connect, watch the link, and jump into settings when you need to change anything.".to_string(),
                                 }
-                                div {
-                                    style: "display: flex; flex-direction: column; gap: 10px;",
-                                    if home_recent_logs.is_empty() {
-                                        EmptyState {
-                                            title: "No runtime events yet".to_string(),
-                                            detail: "Import a profile or connect to populate this feed.".to_string(),
-                                        }
-                                    } else {
-                                        for entry in home_recent_logs.iter() {
-                                            ActivityRow {
-                                                message: entry.message.clone(),
-                                                age: format_relative_time(entry.recorded_at, now),
-                                            }
-                                        }
-                                    }
+                                StatusLine { label: "VPN", value: vpn_badge_label(&status_snapshot).to_string() }
+                                StatusLine { label: "Transport", value: summarize_protocol(&status_snapshot) }
+                                StatusLine { label: "Last connected", value: last_connected.clone() }
+                                StatusLine { label: "Local SOCKS", value: status_snapshot.local_socks.clone() }
+                                p {
+                                    style: "margin: 14px 0 0; color: #6e7b91; font-size: 12px; line-height: 1.5;",
+                                    "Settings now owns direct import, manual editing, saved profiles, Android VPN controls, and diagnostics."
                                 }
                             }
                         }
@@ -2319,7 +3028,17 @@ fn App() -> Element {
                                         onclick: move |_| prefs.with_mut(|current| current.show_advanced_fields = !current.show_advanced_fields),
                                         if prefs_snapshot.show_advanced_fields { "Expert mode: On" } else { "Expert mode: Off" }
                                     }
-                                    if prefs_snapshot.show_advanced_fields {
+                                    if show_udp_toggle_in_primary_controls() {
+                                        button {
+                                            style: filter_chip_style(form_snapshot.local_udp_enabled),
+                                            onclick: move |_| {
+                                                let next = !form().local_udp_enabled;
+                                                form.write().local_udp_enabled = next;
+                                            },
+                                            if form_snapshot.local_udp_enabled { "UDP relay: ON" } else { "UDP relay: OFF" }
+                                        }
+                                    }
+                                    if show_expert_transport_toggles(prefs_snapshot.show_advanced_fields) {
                                         button {
                                             style: filter_chip_style(form_snapshot.insecure_tls),
                                             onclick: move |_| {
@@ -2350,7 +3069,7 @@ fn App() -> Element {
                                 } else if !prefs_snapshot.show_advanced_fields {
                                     p {
                                         style: "margin: 14px 0 0; color: #6e7b91; font-size: 12px; line-height: 1.5;",
-                                        "Normal mobile flow is ready. Leave Expert mode off unless you need explicit CA files, TLS insecure, pinning, bandwidth caps, or QUIC tuning."
+                                        "Normal mobile flow is ready. UDP relay stays visible here; leave Expert mode off unless you need explicit CA files, TLS insecure, pinning, bandwidth caps, or QUIC tuning."
                                     }
                                 }
                             }
@@ -2443,7 +3162,7 @@ fn App() -> Element {
                                     subtitle: "Operational counters and the last observed transport state.".to_string(),
                                 }
                                 div {
-                                    style: "display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px;",
+                                    class: "grid-2 gap-12",
                                     MetricCard {
                                         eyebrow: "Online time",
                                         value: online_duration,
@@ -2477,10 +3196,20 @@ fn App() -> Element {
                                     title: "Connection Health",
                                     subtitle: "Lightweight stability indicators derived from the live session.".to_string(),
                                 }
+                                MetricCard {
+                                    eyebrow: "DNS failures",
+                                    value: metrics_snapshot.dns_failure_count.to_string(),
+                                    detail: "Requests that ended in local DNS proxy failure or SERVFAIL.",
+                                    tone: if metrics_snapshot.dns_failure_count == 0 {
+                                        AccentTone::Positive
+                                    } else {
+                                        AccentTone::Warning
+                                    },
+                                }
                                 ProgressMetric {
                                     label: "Stability",
                                     value: health_score,
-                                    detail: format!("{} successful connects, {} reconnects, {} errors.", metrics_snapshot.successful_connections, metrics_snapshot.reconnect_count, metrics_snapshot.error_count),
+                                    detail: format!("{} successful connects, {} reconnects, {} errors, {} DNS failures.", metrics_snapshot.successful_connections, metrics_snapshot.reconnect_count, metrics_snapshot.error_count, metrics_snapshot.dns_failure_count),
                                     tone: AccentTone::Positive,
                                 }
                                 ProgressMetric {
@@ -2493,7 +3222,7 @@ fn App() -> Element {
                                     label: "Transport health",
                                     value: transport_score,
                                     detail: summarize_protocol(&status_snapshot),
-                                    tone: if status_snapshot.udp_enabled { AccentTone::Accent } else { AccentTone::Neutral },
+                                    tone: udp_status_tone(&status_snapshot),
                                 }
                             }
 
@@ -2505,7 +3234,7 @@ fn App() -> Element {
                                 }
                                 StatusLine { label: "Phase", value: status_snapshot.phase.clone() }
                                 StatusLine { label: "Remote", value: display_or_dash(&status_snapshot.remote) }
-                                StatusLine { label: "UDP enabled", value: bool_word(status_snapshot.udp_enabled).to_string() }
+                                StatusLine { label: "UDP status", value: udp_status_label(&status_snapshot).to_string() }
                                 StatusLine { label: "VPN available", value: bool_word(status_snapshot.vpn_available).to_string() }
                                 StatusLine { label: "VPN permission", value: bool_word(status_snapshot.vpn_permission_granted).to_string() }
                                 StatusLine { label: "VPN active", value: bool_word(status_snapshot.vpn_active).to_string() }
@@ -2562,56 +3291,229 @@ fn App() -> Element {
                             section {
                                 style: panel_style(&prefs_snapshot),
                                 SectionHeader {
-                                    title: "Connection Settings",
-                                    subtitle: "The main path stays minimal. Expert transport and trust overrides live with the draft editor.".to_string(),
+                                    title: "Direct Import",
+                                    subtitle: "Paste a hysteria2:// link or a compatible YAML client config. This updates the active draft below.".to_string(),
                                 }
-                                SettingRow {
-                                    label: "Expert controls",
-                                    detail: (if prefs_snapshot.show_advanced_fields {
-                                        "Expert controls are currently visible in Active Draft."
-                                    } else {
-                                        "Expert controls are hidden. Open Active Draft to manage explicit CA, TLS insecure, pinning, bandwidth caps, and QUIC tuning."
-                                    })
-                                    .to_string(),
-                                    control: rsx! {
+                                textarea {
+                                    style: input_style(true, &prefs_snapshot),
+                                    value: form_snapshot.import_uri.clone(),
+                                    placeholder: "Paste hysteria2://... or YAML here",
+                                    oninput: move |evt| form.write().import_uri = evt.value(),
+                                }
+                                div {
+                                    style: "display: flex; gap: 12px; margin-top: 14px; flex-wrap: wrap;",
+                                    PrimaryButton {
+                                        label: "Import Paste",
+                                        disabled: form_snapshot.import_uri.trim().is_empty(),
+                                        secondary: false,
+                                        onclick: move |_| {
+                                            let current = form();
+                                            let raw_input = current.import_uri.clone();
+                                            match apply_settings_import(&current, &raw_input) {
+                                                Ok((imported, warning)) => {
+                                                    let label = if raw_input.trim().starts_with("hy2://")
+                                                        || raw_input.trim().starts_with("hysteria2://")
+                                                    {
+                                                        format!("Direct · {}", summarize_endpoint(&imported.server))
+                                                    } else {
+                                                        "Pasted config".to_string()
+                                                    };
+                                                    imported_config_name.set(label);
+                                                    form.set(imported.clone());
+                                                    append_log(
+                                                        &mut logs,
+                                                        format!(
+                                                            "settings import applied -> {}",
+                                                            config_value_or_empty(&imported.server)
+                                                        ),
+                                                    );
+                                                    if let Some(warning) = warning {
+                                                        append_log(&mut logs, warning);
+                                                    }
+                                                }
+                                                Err(err) => append_log(
+                                                    &mut logs,
+                                                    format!("settings import failed: {err:#}"),
+                                                ),
+                                            }
+                                        },
+                                    }
+                                    PrimaryButton {
+                                        label: "Import File",
+                                        disabled: false,
+                                        secondary: true,
+                                        onclick: move |_| match android_bridge::request_config_import() {
+                                            Ok(_) => append_log(&mut logs, "opened Android config picker".to_string()),
+                                            Err(err) => append_log(&mut logs, format!("open config picker failed: {err:#}")),
+                                        },
+                                    }
+                                    PrimaryButton {
+                                        label: "Import Cert",
+                                        disabled: false,
+                                        secondary: true,
+                                        onclick: move |_| match android_bridge::request_ca_import() {
+                                            Ok(_) => append_log(&mut logs, "opened Android certificate picker".to_string()),
+                                            Err(err) => append_log(&mut logs, format!("open certificate picker failed: {err:#}")),
+                                        },
+                                    }
+                                }
+                                p {
+                                    style: "margin: 14px 0 0; color: #6e7b91; font-size: 12px; line-height: 1.5;",
+                                    "示例: hysteria2://token@hi.wedevs.org:12443/?obfs=salamander&obfs-password=...&sni=hi.wedevs.org"
+                                }
+                            }
+
+                            section {
+                                style: panel_style(&prefs_snapshot),
+                                SectionHeader {
+                                    title: "Connection Draft",
+                                    subtitle: "Everything needed to connect now lives here. Home only shows the live session.".to_string(),
+                                }
+                                FieldRow { label: "Server", placeholder: "Host:port or hy2:// URI", value: form_snapshot.server.clone(), oninput: move |value| form.write().server = value }
+                                FieldRow { label: "Auth", placeholder: "Password or auth token", value: form_snapshot.auth.clone(), oninput: move |value| form.write().auth = value }
+                                FieldRow { label: "Salamander", placeholder: "Optional obfs password", value: form_snapshot.obfs_password.clone(), oninput: move |value| form.write().obfs_password = value }
+                                FieldRow { label: "TLS SNI", placeholder: "Optional SNI override", value: form_snapshot.sni.clone(), oninput: move |value| form.write().sni = value }
+                                div {
+                                    style: "display: flex; gap: 12px; align-items: center; margin-top: 14px; flex-wrap: wrap;",
+                                    button {
+                                        style: filter_chip_style(prefs_snapshot.show_advanced_fields),
+                                        onclick: move |_| prefs.with_mut(|current| current.show_advanced_fields = !current.show_advanced_fields),
+                                        if prefs_snapshot.show_advanced_fields { "Expert mode: On" } else { "Expert mode: Off" }
+                                    }
+                                    if show_udp_toggle_in_primary_controls() {
                                         button {
-                                            style: filter_chip_style(prefs_snapshot.show_advanced_fields),
+                                            style: filter_chip_style(form_snapshot.local_udp_enabled),
                                             onclick: move |_| {
-                                                settings_return_tab.set(AppTab::Nodes);
-                                                active_tab.set(AppTab::Nodes);
+                                                let next = !form().local_udp_enabled;
+                                                form.write().local_udp_enabled = next;
                                             },
-                                            if prefs_snapshot.show_advanced_fields { "Open" } else { "Manage" }
+                                            if form_snapshot.local_udp_enabled { "UDP relay: ON" } else { "UDP relay: OFF" }
                                         }
-                                    },
-                                }
-                                SettingRow {
-                                    label: "Saved profile",
-                                    detail: (if can_load_saved {
-                                        "A local profile is stored in Android SharedPreferences."
-                                    } else {
-                                        "No local profile is stored yet."
-                                    })
-                                    .to_string(),
-                                    control: rsx! {
+                                    }
+                                    if show_expert_transport_toggles(prefs_snapshot.show_advanced_fields) {
                                         button {
-                                            style: filter_chip_style(can_load_saved),
+                                            style: filter_chip_style(form_snapshot.insecure_tls),
                                             onclick: move |_| {
-                                                settings_return_tab.set(AppTab::Nodes);
-                                                active_tab.set(AppTab::Nodes);
+                                                let next = !form().insecure_tls;
+                                                form.write().insecure_tls = next;
                                             },
-                                            if can_load_saved { "Manage" } else { "Create" }
+                                            if form_snapshot.insecure_tls { "TLS insecure: ON" } else { "TLS insecure: OFF" }
                                         }
-                                    },
+                                        button {
+                                            style: filter_chip_style(form_snapshot.quic_disable_path_mtu_discovery),
+                                            onclick: move |_| {
+                                                let next = !form().quic_disable_path_mtu_discovery;
+                                                form.write().quic_disable_path_mtu_discovery = next;
+                                            },
+                                            if form_snapshot.quic_disable_path_mtu_discovery {
+                                                "PMTUD disabled"
+                                            } else {
+                                                "PMTUD enabled"
+                                            }
+                                        }
+                                    }
                                 }
-                                SettingRow {
-                                    label: "Launch automation",
-                                    detail: describe_launch_automation(launch_automation_snapshot),
-                                    control: rsx! {
-                                        StatusPill {
-                                            label: "Read only".to_string(),
-                                            tone: AccentTone::Neutral,
+                                if prefs_snapshot.show_advanced_fields {
+                                    FieldRow { label: "CA path", placeholder: "Optional PEM path inside app storage", value: form_snapshot.ca_path.clone(), oninput: move |value| form.write().ca_path = value }
+                                    CaSelector {
+                                        directory: ca_catalog_snapshot.directory.clone(),
+                                        files: ca_catalog_snapshot.files.clone(),
+                                        selected_path: form_snapshot.ca_path.clone(),
+                                        onselect: move |path: String| {
+                                            form.write().ca_path = path.clone();
+                                            if path.trim().is_empty() {
+                                                append_log(&mut logs, "cleared CA path selection".to_string());
+                                            } else {
+                                                append_log(&mut logs, format!("selected CA path: {path}"));
+                                            }
+                                        },
+                                        onrefresh: move |_| {
+                                            match android_bridge::query_ca_catalog() {
+                                                Ok(catalog) => {
+                                                    let count = catalog.files.len();
+                                                    let directory = catalog.directory.clone();
+                                                    ca_catalog.set(catalog);
+                                                    append_log(
+                                                        &mut logs,
+                                                        format!("refreshed CA catalog: {count} file(s) in {directory}"),
+                                                    );
+                                                }
+                                                Err(err) => append_log(
+                                                    &mut logs,
+                                                    format!("refresh CA catalog failed: {err:#}"),
+                                                ),
+                                            }
                                         }
-                                    },
+                                    }
+                                    FieldRow { label: "pinSHA256", placeholder: "Optional certificate pin", value: form_snapshot.pin_sha256.clone(), oninput: move |value| form.write().pin_sha256 = value }
+                                    FieldRow { label: "Bandwidth up", placeholder: "Optional, e.g. 100 Mbps", value: form_snapshot.bandwidth_up.clone(), oninput: move |value| form.write().bandwidth_up = value }
+                                    FieldRow { label: "Bandwidth down", placeholder: "Optional, e.g. 500 Mbps", value: form_snapshot.bandwidth_down.clone(), oninput: move |value| form.write().bandwidth_down = value }
+                                    FieldRow { label: "QUIC init stream window", placeholder: "Optional bytes, default 268435456", value: form_snapshot.quic_init_stream_receive_window.clone(), oninput: move |value| form.write().quic_init_stream_receive_window = value }
+                                    FieldRow { label: "QUIC max stream window", placeholder: "Optional bytes, default 268435456", value: form_snapshot.quic_max_stream_receive_window.clone(), oninput: move |value| form.write().quic_max_stream_receive_window = value }
+                                    FieldRow { label: "QUIC init conn window", placeholder: "Optional bytes, default 536870912", value: form_snapshot.quic_init_connection_receive_window.clone(), oninput: move |value| form.write().quic_init_connection_receive_window = value }
+                                    FieldRow { label: "QUIC max conn window", placeholder: "Optional bytes, default 536870912", value: form_snapshot.quic_max_connection_receive_window.clone(), oninput: move |value| form.write().quic_max_connection_receive_window = value }
+                                    FieldRow { label: "QUIC idle timeout", placeholder: "Optional duration, default 30s", value: form_snapshot.quic_max_idle_timeout.clone(), oninput: move |value| form.write().quic_max_idle_timeout = value }
+                                    FieldRow { label: "QUIC keep alive", placeholder: "Optional duration, default 10s", value: form_snapshot.quic_keep_alive_period.clone(), oninput: move |value| form.write().quic_keep_alive_period = value }
+                                } else {
+                                    p {
+                                        style: "margin: 14px 0 0; color: #6e7b91; font-size: 12px; line-height: 1.5;",
+                                        "高级模式里可以管理显式 CA、TLS insecure、证书 pin、带宽和 QUIC 参数。"
+                                    }
+                                }
+                            }
+
+                            section {
+                                style: panel_style(&prefs_snapshot),
+                                SectionHeader {
+                                    title: "Profile Storage",
+                                    subtitle: "Persist the current draft locally, then return to Home to connect.".to_string(),
+                                }
+                                div {
+                                    style: "display: flex; gap: 12px; flex-wrap: wrap;",
+                                    PrimaryButton {
+                                        label: "Save Profile",
+                                        disabled: !can_connect,
+                                        secondary: true,
+                                        onclick: {
+                                            let snapshot = form();
+                                            move |_| match android_bridge::save_profile(&snapshot) {
+                                                Ok(_) => {
+                                                    saved_profile.set(Some(snapshot.clone()));
+                                                    append_log(&mut logs, "saved current profile".to_string());
+                                                }
+                                                Err(err) => append_log(&mut logs, format!("save profile failed: {err:#}")),
+                                            }
+                                        },
+                                    }
+                                    PrimaryButton {
+                                        label: "Load Saved",
+                                        disabled: !can_load_saved,
+                                        secondary: true,
+                                        onclick: move |_| match android_bridge::query_saved_profile() {
+                                            Ok(Some(saved)) => {
+                                                form.set(saved.clone());
+                                                saved_profile.set(Some(saved));
+                                                append_log(&mut logs, "loaded saved profile into the draft".to_string());
+                                            }
+                                            Ok(None) => {
+                                                saved_profile.set(None);
+                                                append_log(&mut logs, "no saved profile found".to_string());
+                                            }
+                                            Err(err) => append_log(&mut logs, format!("load saved profile failed: {err:#}")),
+                                        },
+                                    }
+                                    PrimaryButton {
+                                        label: "Clear Saved",
+                                        disabled: !can_load_saved,
+                                        secondary: true,
+                                        onclick: move |_| match android_bridge::clear_saved_profile() {
+                                            Ok(_) => {
+                                                saved_profile.set(None);
+                                                append_log(&mut logs, "cleared saved profile".to_string());
+                                            }
+                                            Err(err) => append_log(&mut logs, format!("clear saved profile failed: {err:#}")),
+                                        },
+                                    }
                                 }
                             }
 
@@ -2662,14 +3564,80 @@ fn App() -> Element {
                                     },
                                 }
                                 SettingRow {
-                                    label: "Transport bridge",
-                                    detail: "When active, Android routes traffic through tun2socks into the local SOCKS runtime.".to_string(),
+                                    label: "Launch automation",
+                                    detail: describe_launch_automation(launch_automation_snapshot),
                                     control: rsx! {
                                         StatusPill {
-                                            label: if status_snapshot.vpn_active { "Attached".to_string() } else { "Idle".to_string() },
-                                            tone: if status_snapshot.vpn_active { AccentTone::Positive } else { AccentTone::Neutral },
+                                            label: "Read only".to_string(),
+                                            tone: AccentTone::Neutral,
                                         }
                                     },
+                                }
+                            }
+
+                            section {
+                                style: panel_style(&prefs_snapshot),
+                                SectionHeader {
+                                    title: "Diagnostics",
+                                    subtitle: "Collapsed by default. Expand for session details, logs, and built-in probes.".to_string(),
+                                }
+                                div {
+                                    style: "display: flex; justify-content: space-between; gap: 12px; align-items: center; flex-wrap: wrap;",
+                                    StatusPill {
+                                        label: if diagnostics_expanded_snapshot { "Expanded".to_string() } else { "Collapsed".to_string() },
+                                        tone: if diagnostics_expanded_snapshot { AccentTone::Accent } else { AccentTone::Neutral },
+                                    }
+                                    button {
+                                        style: filter_chip_style(diagnostics_expanded_snapshot),
+                                        onclick: move |_| diagnostics_expanded.set(!diagnostics_expanded()),
+                                        if diagnostics_expanded_snapshot { "Hide Diagnostics" } else { "Show Diagnostics" }
+                                    }
+                                }
+                                if diagnostics_expanded_snapshot {
+                                    div {
+                                        style: "display: flex; flex-direction: column; gap: 0; margin-top: 14px; border-radius: 18px; background: rgba(255,255,255,0.03); border: 1px solid rgba(255,255,255,0.06); padding: 4px 16px;",
+                                        StatusLine { label: "Phase", value: status_snapshot.phase.clone() }
+                                        StatusLine { label: "Remote", value: display_or_dash(&status_snapshot.remote) }
+                                        StatusLine { label: "Latency", value: latency_label.clone() }
+                                        StatusLine { label: "Upload total", value: upload_total_label.clone() }
+                                        StatusLine { label: "Download total", value: download_total_label.clone() }
+                                        StatusLine { label: "Local SOCKS", value: status_snapshot.local_socks.clone() }
+                                        StatusLine { label: "Detail", value: status_snapshot.detail.clone() }
+                                    }
+                                    div {
+                                        style: "display: flex; gap: 12px; margin-top: 14px; flex-wrap: wrap;",
+                                        PrimaryButton {
+                                            label: "Download Test",
+                                            disabled: status_snapshot.phase != "Connected",
+                                            secondary: false,
+                                            onclick: {
+                                                let controller = controller.clone();
+                                                move |_| controller.send(AppCommand::Speedtest(SpeedDirection::Download))
+                                            },
+                                        }
+                                        PrimaryButton {
+                                            label: "Upload Test",
+                                            disabled: status_snapshot.phase != "Connected",
+                                            secondary: true,
+                                            onclick: {
+                                                let controller = controller.clone();
+                                                move |_| controller.send(AppCommand::Speedtest(SpeedDirection::Upload))
+                                            },
+                                        }
+                                    }
+                                    div {
+                                        style: "display: flex; flex-direction: column; gap: 10px; margin-top: 14px;",
+                                        if stats_recent_logs.is_empty() {
+                                            EmptyState {
+                                                title: "No diagnostics yet".to_string(),
+                                                detail: "Runtime events will appear here after import, connect, reconnect, and speedtest actions.".to_string(),
+                                            }
+                                        } else {
+                                            for entry in stats_recent_logs.iter() {
+                                                ActivityRow { message: entry.message.clone(), age: format_relative_time(entry.recorded_at, now) }
+                                            }
+                                        }
+                                    }
                                 }
                             }
 
@@ -2712,17 +3680,17 @@ fn TopBar(
 ) -> Element {
     rsx! {
         section {
-            style: "position: sticky; top: 0; z-index: 3; display: flex; flex-direction: column; gap: 4px; padding: 10px 0 12px; background: linear-gradient(180deg, rgba(16,19,26,0.96) 0%, rgba(16,19,26,0.88) 70%, rgba(16,19,26,0) 100%); backdrop-filter: blur(12px);",
+            style: "position: sticky; top: 0; z-index: 3; padding: 10px 0 12px; background: linear-gradient(180deg, rgba(16,19,26,0.96) 0%, rgba(16,19,26,0.88) 70%, rgba(16,19,26,0) 100%); backdrop-filter: blur(12px);",
             div {
-                style: "display: flex; justify-content: space-between; gap: 12px; align-items: center;",
+                class: "row between gap-12 center",
                 div {
-                    style: "display: flex; flex-direction: column; gap: 4px; min-width: 0;",
+                    class: "col gap-4 min-w-0",
                     span {
-                        style: "font-size: 22px; line-height: 1.2; font-weight: 600; letter-spacing: -0.01em;",
+                        class: "text-22 fw-600 tracking-title",
                         "{title}"
                     }
                     p {
-                        style: "margin: 0; color: #a8b3c7; font-size: 14px; line-height: 1.5;",
+                        class: "m-0 text-base c-secondary",
                         "{subtitle}"
                     }
                 }
@@ -2758,13 +3726,13 @@ fn BottomNav(active: AppTab, onselect: EventHandler<AppTab>) -> Element {
 fn SectionHeader(title: &'static str, subtitle: String) -> Element {
     rsx! {
         div {
-            style: "display: flex; flex-direction: column; gap: 6px; margin-bottom: 14px;",
+            class: "section-header",
             h2 {
-                style: "margin: 0; font-size: 20px; font-weight: 600; letter-spacing: -0.02em;",
+                class: "m-0 text-xl fw-600 tracking-tight",
                 "{title}"
             }
             p {
-                style: "margin: 0; color: #a8b3c7; font-size: 13px; line-height: 1.5;",
+                class: "m-0 text-sm c-secondary",
                 "{subtitle}"
             }
         }
@@ -2780,8 +3748,8 @@ fn FieldRow(
 ) -> Element {
     rsx! {
         label {
-            style: "display: flex; flex-direction: column; gap: 8px; margin-top: 12px;",
-            span { style: "color: #a8b3c7; font-size: 13px;", "{label}" }
+            class: "field-label",
+            span { class: "text-sm c-secondary", "{label}" }
             input {
                 style: input_style(false, &UiPrefs::default()),
                 value: value.clone(),
@@ -2804,17 +3772,14 @@ fn CaSelector(
     let has_selected_path = !selected_path.trim().is_empty();
     rsx! {
         div {
-            style: "display: flex; flex-direction: column; gap: 10px; margin-top: 12px;",
+            class: "col gap-10 mt-12",
             div {
-                style: "display: flex; justify-content: space-between; gap: 12px; align-items: flex-start; flex-wrap: wrap;",
+                class: "row between gap-12 start wrap",
                 div {
-                    style: "display: flex; flex-direction: column; gap: 6px;",
-                    span {
-                        style: "color: #a8b3c7; font-size: 13px;",
-                        "Installed CAs"
-                    }
+                    class: "col gap-6",
+                    span { class: "text-sm c-secondary", "Installed CAs" }
                     p {
-                        style: "margin: 0; color: #6e7b91; font-size: 12px; line-height: 1.5;",
+                        class: "m-0 text-xs c-muted",
                         if has_directory {
                             "ADB directory: {directory}"
                         } else {
@@ -2823,7 +3788,7 @@ fn CaSelector(
                     }
                 }
                 div {
-                    style: "display: flex; gap: 8px; flex-wrap: wrap;",
+                    class: "row wrap gap-8",
                     button {
                         style: filter_chip_style(false),
                         onclick: move |_| onrefresh.call(()),
@@ -2840,12 +3805,12 @@ fn CaSelector(
             }
             if files.is_empty() {
                 p {
-                    style: "margin: 0; color: #6e7b91; font-size: 12px; line-height: 1.5;",
+                    class: "m-0 text-xs c-muted",
                     "No CA files found. Push a .crt or .pem file into the directory above, then refresh."
                 }
             } else {
                 div {
-                    style: "display: flex; flex-direction: column; gap: 10px;",
+                    class: "col gap-10",
                     for file in files {
                         button {
                             style: selectable_item_style(selected_path == file.path),
@@ -2854,9 +3819,9 @@ fn CaSelector(
                                 move |_| onselect.call(file_path.clone())
                             },
                             div {
-                                style: "display: flex; flex-direction: column; align-items: flex-start; gap: 4px; width: 100%;",
+                                class: "col start gap-4 w-full",
                                 strong {
-                                    style: "font-size: 14px; color: #f3f7ff; font-weight: 600;",
+                                    class: "text-base c-primary fw-600",
                                     if selected_path == file.path {
                                         "Using {file.name}"
                                     } else {
@@ -2864,7 +3829,7 @@ fn CaSelector(
                                     }
                                 }
                                 span {
-                                    style: "font-size: 12px; color: #a8b3c7; line-height: 1.5; text-align: left;",
+                                    class: "text-xs c-secondary text-left",
                                     "{file.path}"
                                 }
                             }
@@ -2874,7 +3839,7 @@ fn CaSelector(
             }
             if has_selected_path {
                 p {
-                    style: "margin: 0; color: #6e7b91; font-size: 12px; line-height: 1.5;",
+                    class: "m-0 text-xs c-muted",
                     "Selected path: {selected_path}"
                 }
             }
@@ -2886,13 +3851,13 @@ fn CaSelector(
 fn StatusLine(label: &'static str, value: String) -> Element {
     rsx! {
         div {
-            style: "display: flex; justify-content: space-between; gap: 16px; padding: 10px 0; border-bottom: 1px solid rgba(255,255,255,0.06); align-items: flex-start;",
+            class: "status-line",
             strong {
-                style: "min-width: 112px; color: #f3f7ff; font-size: 14px; font-weight: 500;",
+                class: "status-line-label c-primary text-base fw-500",
                 "{label}"
             }
             span {
-                style: "text-align: right; color: #a8b3c7; font-size: 14px; line-height: 1.5;",
+                class: "status-line-value c-secondary text-base",
                 "{value}"
             }
         }
@@ -2931,34 +3896,6 @@ fn MetricCard(eyebrow: &'static str, value: String, detail: String, tone: Accent
 }
 
 #[component]
-fn QuickActionCard(
-    title: &'static str,
-    detail: &'static str,
-    tone: AccentTone,
-    disabled: bool,
-    onclick: EventHandler<()>,
-) -> Element {
-    rsx! {
-        button {
-            style: button_style_with_state(quick_action_style(tone), !disabled),
-            disabled: disabled,
-            onclick: move |_| onclick.call(()),
-            div {
-                style: "display: flex; flex-direction: column; align-items: flex-start; gap: 8px; width: 100%;",
-                strong {
-                    style: "font-size: 15px; color: #f3f7ff; font-weight: 600;",
-                    "{title}"
-                }
-                span {
-                    style: "font-size: 12px; color: #a8b3c7; line-height: 1.5; text-align: left;",
-                    "{detail}"
-                }
-            }
-        }
-    }
-}
-
-#[component]
 fn PrimaryButton(
     label: &'static str,
     disabled: bool,
@@ -2967,7 +3904,7 @@ fn PrimaryButton(
 ) -> Element {
     rsx! {
         button {
-            style: button_style_with_state(button_surface_style(secondary), !disabled),
+            style: button_style_with_state(button_surface_style(secondary), secondary, !disabled),
             disabled: disabled,
             onclick: move |_| onclick.call(()),
             "{label}"
@@ -2991,15 +3928,15 @@ fn NodeItemCard(
         div {
             style: node_card_style(selected, tone),
             div {
-                style: "display: flex; justify-content: space-between; gap: 12px; align-items: flex-start;",
+                class: "row between gap-12 start",
                 div {
-                    style: "display: flex; flex-direction: column; gap: 6px;",
+                    class: "col gap-6",
                     strong {
-                        style: "font-size: 16px; color: #f3f7ff; font-weight: 600;",
+                        class: "text-lg c-primary fw-600",
                         "{title}"
                     }
                     span {
-                        style: "font-size: 13px; color: #a8b3c7; line-height: 1.5;",
+                        class: "text-sm c-secondary",
                         "{subtitle}"
                     }
                 }
@@ -3009,17 +3946,17 @@ fn NodeItemCard(
                 }
             }
             p {
-                style: "margin: 12px 0 0; color: #6e7b91; font-size: 13px; line-height: 1.5;",
+                class: "m-0 text-sm c-muted mt-12",
                 "{meta}"
             }
             div {
-                style: "display: flex; gap: 8px; flex-wrap: wrap; margin-top: 14px;",
+                class: "tag-row mt-14",
                 for tag in tags {
                     StatusPill { label: tag, tone: tone }
                 }
             }
             button {
-                style: button_style_with_state(button_surface_style(true), !disabled),
+                style: button_style_with_state(button_surface_style(true), true, !disabled),
                 disabled: disabled,
                 onclick: move |_| onclick.call(()),
                 "{action_label}"
@@ -3032,18 +3969,18 @@ fn NodeItemCard(
 fn ProgressMetric(label: &'static str, value: u8, detail: String, tone: AccentTone) -> Element {
     rsx! {
         div {
-            style: "display: flex; flex-direction: column; gap: 8px; margin-top: 14px;",
+            class: "col gap-8 mt-14",
             div {
-                style: "display: flex; justify-content: space-between; gap: 12px;",
-                strong { style: "font-size: 14px; color: #f3f7ff;", "{label}" }
-                span { style: "font-size: 13px; color: #a8b3c7;", "{value}%" }
+                class: "row between gap-12",
+                strong { class: "text-base c-primary", "{label}" }
+                span { class: "text-sm c-secondary", "{value}%" }
             }
             div {
                 style: progress_track_style(),
                 div { style: progress_fill_style(value, tone) }
             }
             p {
-                style: "margin: 0; color: #6e7b91; font-size: 13px; line-height: 1.5;",
+                class: "m-0 text-sm c-muted",
                 "{detail}"
             }
         }
@@ -3054,15 +3991,9 @@ fn ProgressMetric(label: &'static str, value: u8, detail: String, tone: AccentTo
 fn ActivityRow(message: String, age: String) -> Element {
     rsx! {
         div {
-            style: "display: flex; justify-content: space-between; gap: 14px; padding: 12px 14px; border-radius: 16px; background: rgba(255,255,255,0.03); border: 1px solid rgba(255,255,255,0.05);",
-            span {
-                style: "font-size: 14px; color: #f3f7ff; line-height: 1.5;",
-                "{message}"
-            }
-            span {
-                style: "font-size: 12px; color: #6e7b91; white-space: nowrap;",
-                "{age}"
-            }
+            class: "activity-row",
+            span { class: "text-base c-primary", "{message}" }
+            span { class: "text-xs c-muted nowrap", "{age}" }
         }
     }
 }
@@ -3071,15 +4002,9 @@ fn ActivityRow(message: String, age: String) -> Element {
 fn EmptyState(title: String, detail: String) -> Element {
     rsx! {
         div {
-            style: "display: flex; flex-direction: column; gap: 6px; padding: 18px; border-radius: 18px; background: rgba(255,255,255,0.03); border: 1px dashed rgba(255,255,255,0.08);",
-            strong {
-                style: "font-size: 15px; color: #f3f7ff;",
-                "{title}"
-            }
-            p {
-                style: "margin: 0; font-size: 13px; color: #a8b3c7; line-height: 1.5;",
-                "{detail}"
-            }
+            class: "empty-state",
+            strong { class: "text-lg c-primary", "{title}" }
+            p { class: "m-0 text-sm c-secondary", "{detail}" }
         }
     }
 }
@@ -3088,17 +4013,11 @@ fn EmptyState(title: String, detail: String) -> Element {
 fn SettingRow(label: &'static str, detail: String, control: Element) -> Element {
     rsx! {
         div {
-            style: "display: flex; justify-content: space-between; gap: 16px; padding: 14px 0; border-bottom: 1px solid rgba(255,255,255,0.06); align-items: center;",
+            class: "setting-row",
             div {
-                style: "display: flex; flex-direction: column; gap: 6px;",
-                strong {
-                    style: "font-size: 14px; color: #f3f7ff; font-weight: 500;",
-                    "{label}"
-                }
-                p {
-                    style: "margin: 0; color: #a8b3c7; font-size: 13px; line-height: 1.5;",
-                    "{detail}"
-                }
+                class: "col gap-6",
+                strong { class: "text-base c-primary fw-500", "{label}" }
+                p { class: "m-0 text-sm c-secondary", "{detail}" }
             }
             {control}
         }
@@ -3276,7 +4195,9 @@ async fn connect_client(form: FormState) -> Result<(Client, UiStatus)> {
         remote: client.remote_addr().to_string(),
         detail: "Client connected. Local SOCKS is ready and Android system VPN can be started."
             .to_string(),
-        udp_enabled: info.udp_enabled,
+        server_udp_supported: info.udp_enabled,
+        local_udp_enabled: !local_socks_udp_disabled(&normalized),
+        udp_enabled: info.udp_enabled && !local_socks_udp_disabled(&normalized),
         negotiated_tx: info.tx,
         ..UiStatus::default()
     };
@@ -3416,6 +4337,7 @@ fn import_share_uri(input: &str) -> Result<FormState> {
         quic_max_connection_receive_window: String::new(),
         quic_max_idle_timeout: String::new(),
         quic_keep_alive_period: String::new(),
+        local_udp_enabled: true,
         quic_disable_path_mtu_discovery: false,
         insecure_tls: query
             .get("insecure")
@@ -3478,6 +4400,7 @@ fn parse_imported_client_document(input: &str) -> Result<(FormState, Option<Stri
             ),
             quic_max_idle_timeout: optional_duration_text(config.quic.max_idle_timeout),
             quic_keep_alive_period: optional_duration_text(config.quic.keep_alive_period),
+            local_udp_enabled: true,
             quic_disable_path_mtu_discovery: config.quic.disable_path_mtu_discovery,
             insecure_tls: config.tls.insecure,
         },
@@ -3625,15 +4548,48 @@ where
     let file = File::open(Path::new(path))
         .with_context(|| format!("failed to open certificate file {path}"))?;
     let mut reader = BufReader::new(file);
-    let certs = rustls_pemfile::certs(&mut reader)
-        .with_context(|| format!("failed to parse PEM certificates from {path}"))?;
+    parse_pem_certificates(&mut reader, path)
+}
+
+fn parse_pem_certificates<R>(
+    reader: &mut R,
+    source: &str,
+) -> Result<Vec<CertificateDer<'static>>>
+where
+    R: BufRead,
+{
+    let certs = rustls_pemfile::certs(reader)
+        .with_context(|| format!("failed to parse PEM certificates from {source}"))?;
     if certs.is_empty() {
-        bail!("no certificates found in {path}");
+        bail!("no certificates found in {source}");
     }
     Ok(certs.into_iter().map(CertificateDer::from).collect())
 }
 
-fn load_system_root_certificates() -> Result<Vec<CertificateDer<'static>>> {
+fn load_system_root_certificates_with<F, G>(
+    platform_loader: Option<F>,
+    native_loader: G,
+) -> Result<Vec<CertificateDer<'static>>>
+where
+    F: FnOnce() -> Result<Vec<CertificateDer<'static>>>,
+    G: FnOnce() -> Result<Vec<CertificateDer<'static>>>,
+{
+    if let Some(loader) = platform_loader {
+        return loader().context("failed to load platform system root certificates");
+    }
+
+    native_loader()
+}
+
+#[cfg(target_os = "android")]
+fn load_android_system_root_certificates() -> Result<Vec<CertificateDer<'static>>> {
+    let bundle = android_bridge::system_ca_pem_bundle()
+        .context("failed to read Android system CA store")?;
+    let mut reader = Cursor::new(bundle.into_bytes());
+    parse_pem_certificates(&mut reader, "Android system trust store")
+}
+
+fn load_native_system_root_certificates() -> Result<Vec<CertificateDer<'static>>> {
     let result = rustls_native_certs::load_native_certs();
     if !result.certs.is_empty() {
         return Ok(result.certs);
@@ -3652,6 +4608,24 @@ fn load_system_root_certificates() -> Result<Vec<CertificateDer<'static>>> {
         .collect::<Vec<_>>()
         .join("; ");
     bail!("failed to load system root certificates: {details}");
+}
+
+fn load_system_root_certificates() -> Result<Vec<CertificateDer<'static>>> {
+    #[cfg(target_os = "android")]
+    {
+        return load_system_root_certificates_with(
+            Some(load_android_system_root_certificates as fn() -> Result<Vec<CertificateDer<'static>>>),
+            load_native_system_root_certificates,
+        );
+    }
+
+    #[cfg(not(target_os = "android"))]
+    {
+        load_system_root_certificates_with(
+            None::<fn() -> Result<Vec<CertificateDer<'static>>>>,
+            load_native_system_root_certificates,
+        )
+    }
 }
 
 fn parse_optional_pinned_sha256(input: &str) -> Result<Option<[u8; 32]>> {
@@ -3736,6 +4710,16 @@ fn record_log_metrics(metrics: &mut Signal<UiMetrics>, message: &str) {
         if let Some(average) = parse_speedtest_average(message, "upload") {
             current.latest_upload = Some(average);
         }
+    });
+}
+
+fn note_dns_failure(metrics: &mut UiMetrics) {
+    metrics.dns_failure_count = metrics.dns_failure_count.saturating_add(1);
+}
+
+fn record_dns_failure(metrics: &mut Signal<UiMetrics>) {
+    metrics.with_mut(|current| {
+        note_dns_failure(current);
     });
 }
 
@@ -3842,11 +4826,7 @@ fn build_node_cards(
             meta: status.detail.clone(),
             tags: vec![
                 "Connected".to_string(),
-                if status.udp_enabled {
-                    "UDP".to_string()
-                } else {
-                    "TCP only".to_string()
-                },
+                udp_status_short_tag(status).to_string(),
             ],
             selected: status.phase == "Connected" || status.phase == "Speedtest",
             tone: AccentTone::Accent,
@@ -3925,12 +4905,42 @@ fn vpn_badge_label(status: &UiStatus) -> &'static str {
     }
 }
 
-fn summarize_protocol(status: &UiStatus) -> String {
-    let udp = if status.udp_enabled {
+fn udp_status_label(status: &UiStatus) -> &'static str {
+    if status.udp_enabled {
         "UDP relay ready"
+    } else if !status.local_udp_enabled {
+        "UDP disabled locally"
+    } else if !status.server_udp_supported {
+        "Server UDP unavailable"
     } else {
         "UDP unavailable"
-    };
+    }
+}
+
+fn udp_status_short_tag(status: &UiStatus) -> &'static str {
+    if status.udp_enabled {
+        "UDP"
+    } else if !status.local_udp_enabled {
+        "UDP off"
+    } else if !status.server_udp_supported {
+        "Server TCP only"
+    } else {
+        "TCP only"
+    }
+}
+
+fn udp_status_tone(status: &UiStatus) -> AccentTone {
+    if status.udp_enabled {
+        AccentTone::Accent
+    } else if !status.local_udp_enabled || !status.server_udp_supported {
+        AccentTone::Neutral
+    } else {
+        AccentTone::Warning
+    }
+}
+
+fn summarize_protocol(status: &UiStatus) -> String {
+    let udp = udp_status_label(status);
     if status.remote.trim().is_empty() {
         format!("QUIC client idle / {udp}")
     } else {
@@ -3976,10 +4986,6 @@ fn display_or_dash(value: &str) -> String {
     }
 }
 
-fn present_absent_label(value: bool) -> &'static str {
-    if value { "Present" } else { "Absent" }
-}
-
 fn bool_word(value: bool) -> &'static str {
     if value { "Yes" } else { "No" }
 }
@@ -3993,6 +4999,9 @@ fn format_negotiated_rate(bytes_per_second: u64) -> String {
 }
 
 fn format_bytes_per_second(bytes_per_second: u64) -> String {
+    if bytes_per_second == 0 {
+        return "0 B/s".to_string();
+    }
     let mut value = bytes_per_second as f64;
     let units = ["B/s", "KB/s", "MB/s", "GB/s"];
     let mut unit_index = 0usize;
@@ -4001,6 +5010,28 @@ fn format_bytes_per_second(bytes_per_second: u64) -> String {
         unit_index += 1;
     }
     format!("{value:.1} {}", units[unit_index])
+}
+
+fn format_total_bytes(bytes: u64) -> String {
+    let mut value = bytes as f64;
+    let units = ["B", "KB", "MB", "GB", "TB"];
+    let mut unit_index = 0usize;
+    while value >= 1024.0 && unit_index < units.len() - 1 {
+        value /= 1024.0;
+        unit_index += 1;
+    }
+    if unit_index == 0 {
+        format!("{} {}", bytes, units[unit_index])
+    } else {
+        format!("{value:.1} {}", units[unit_index])
+    }
+}
+
+fn format_latency(latency: Option<Duration>) -> String {
+    match latency {
+        Some(value) => format!("{} ms", value.as_millis()),
+        None => "--".to_string(),
+    }
 }
 
 fn format_elapsed(started: Instant, now: Instant) -> String {
@@ -4078,6 +5109,63 @@ fn trim_middle(value: &str, max: usize) -> String {
     format!("{start}...{end}")
 }
 
+fn ui_stylesheet() -> &'static str {
+    concat!(
+        ".col{display:flex;flex-direction:column}",
+        ".row{display:flex;flex-direction:row}",
+        ".wrap{flex-wrap:wrap}",
+        ".center{align-items:center}",
+        ".start{align-items:flex-start}",
+        ".between{justify-content:space-between}",
+        ".end-x{justify-content:flex-end}",
+        ".w-full{width:100%;box-sizing:border-box}",
+        ".min-w-0{min-width:0}",
+        ".gap-4{gap:4px}",
+        ".gap-6{gap:6px}",
+        ".gap-8{gap:8px}",
+        ".gap-10{gap:10px}",
+        ".gap-12{gap:12px}",
+        ".gap-14{gap:14px}",
+        ".gap-16{gap:16px}",
+        ".gap-18{gap:18px}",
+        ".grid-2{display:grid;grid-template-columns:repeat(2,minmax(0,1fr))}",
+        ".text-xs{font-size:12px;line-height:1.5}",
+        ".text-sm{font-size:13px;line-height:1.5}",
+        ".text-base{font-size:14px;line-height:1.5}",
+        ".text-lg{font-size:16px;line-height:1.4}",
+        ".text-xl{font-size:20px;line-height:1.3}",
+        ".text-2xl{font-size:24px;line-height:1.15}",
+        ".text-22{font-size:22px;line-height:1.2}",
+        ".c-primary{color:var(--text-primary)}",
+        ".c-secondary{color:var(--text-secondary)}",
+        ".c-muted{color:var(--text-muted)}",
+        ".fw-500{font-weight:500}",
+        ".fw-600{font-weight:600}",
+        ".m-0{margin:0}",
+        ".mt-6{margin-top:6px}",
+        ".mt-8{margin-top:8px}",
+        ".mt-12{margin-top:12px}",
+        ".mt-14{margin-top:14px}",
+        ".nowrap{white-space:nowrap}",
+        ".text-right{text-align:right}",
+        ".text-left{text-align:left}",
+        ".tracking-tight{letter-spacing:-0.02em}",
+        ".tracking-tighter{letter-spacing:-0.03em}",
+        ".tracking-title{letter-spacing:-0.01em}",
+        ".uppercase{text-transform:uppercase;letter-spacing:0.1em}",
+        ".section-header{display:flex;flex-direction:column;gap:6px;margin-bottom:14px}",
+        ".field-label{display:flex;flex-direction:column;gap:8px;margin-top:12px}",
+        ".status-line{display:flex;justify-content:space-between;gap:16px;padding:10px 0;border-bottom:1px solid rgba(255,255,255,0.06);align-items:flex-start}",
+        ".status-line-label{flex:0 0 112px;min-width:112px}",
+        ".status-line-value{flex:1;min-width:0;text-align:right;overflow-wrap:anywhere;word-break:break-word}",
+        ".setting-row{display:flex;justify-content:space-between;gap:16px;padding:14px 0;border-bottom:1px solid rgba(255,255,255,0.06);align-items:center}",
+        ".activity-row{display:flex;justify-content:space-between;gap:14px;padding:12px 14px;border-radius:16px;background:rgba(255,255,255,0.03);border:1px solid rgba(255,255,255,0.05)}",
+        ".empty-state{display:flex;flex-direction:column;gap:6px;padding:18px;border-radius:18px;background:rgba(255,255,255,0.03);border:1px dashed rgba(255,255,255,0.08)}",
+        ".info-box{border-radius:18px;background:rgba(255,255,255,0.03);border:1px solid rgba(255,255,255,0.06);padding:4px 16px}",
+        ".tag-row{display:flex;gap:8px;flex-wrap:wrap}",
+    )
+}
+
 fn app_shell_style(prefs: &UiPrefs) -> String {
     format!(
         concat!(
@@ -4085,6 +5173,10 @@ fn app_shell_style(prefs: &UiPrefs) -> String {
             "--surface: #171B22;",
             "--surface-container: #1D222B;",
             "--surface-container-high: #232A34;",
+            "--bg-accent-a: rgba(255,111,145,0.24);",
+            "--bg-accent-b: rgba(96,165,250,0.22);",
+            "--bg-accent-c: rgba(251,191,36,0.18);",
+            "--bg-accent-d: rgba(52,211,153,0.16);",
             "--text-primary: #F3F6FB;",
             "--text-secondary: #BCC5D3;",
             "--text-muted: #8893A5;",
@@ -4098,7 +5190,12 @@ fn app_shell_style(prefs: &UiPrefs) -> String {
             "font-family: system-ui, -apple-system, BlinkMacSystemFont, \"Segoe UI\", sans-serif;",
             "min-height: 100vh;",
             "padding: {}px 16px 112px;",
-            "background: linear-gradient(180deg, #10131A 0%, #0E1117 100%);",
+            "background:",
+            "radial-gradient(circle at top left, var(--bg-accent-a) 0%, transparent 42%),",
+            "radial-gradient(circle at top right, var(--bg-accent-b) 0%, transparent 36%),",
+            "radial-gradient(circle at 18% 78%, var(--bg-accent-c) 0%, transparent 28%),",
+            "radial-gradient(circle at 82% 72%, var(--bg-accent-d) 0%, transparent 30%),",
+            "linear-gradient(180deg, #120F1E 0%, #0E1624 42%, #0A1118 100%);",
             "color: var(--text-primary);",
             "position: relative;",
             "overflow-x: hidden;"
@@ -4121,7 +5218,7 @@ fn panel_style(prefs: &UiPrefs) -> String {
             "display: flex; flex-direction: column; gap: {}px;",
             "padding: {}px;",
             "border-radius: 24px;",
-            "background: var(--surface-container);",
+            "background: linear-gradient(180deg, rgba(255,255,255,0.045), rgba(255,255,255,0.018)), var(--surface-container);",
             "border: 1px solid var(--border);",
             "box-shadow: 0 8px 24px rgba(0,0,0,0.16);"
         ),
@@ -4210,25 +5307,11 @@ fn metric_card_style(tone: AccentTone) -> String {
     )
 }
 
-fn quick_action_style(tone: AccentTone) -> String {
-    format!(
-        concat!(
-            "display: flex; width: 100%; min-height: 84px; box-sizing: border-box;",
-            "padding: 16px; border-radius: 18px;",
-            "border: 1px solid {};",
-            "background: linear-gradient(180deg, {}, var(--surface-container-high));",
-            "transition: background var(--motion), border-color var(--motion);"
-        ),
-        tone_border(tone),
-        tone_fill(tone)
-    )
-}
-
 fn button_surface_style(secondary: bool) -> &'static str {
     if secondary {
-        "padding: 14px 16px; border-radius: 20px; border: 1px solid var(--border); background: var(--surface-container-high); color: var(--text-primary); font-size: 14px; font-weight: 500; transition: background var(--motion), border-color var(--motion);"
+        "padding: 14px 16px; border-radius: 20px; border: 1px solid rgba(168,199,250,0.18); background: linear-gradient(180deg, rgba(255,255,255,0.05), rgba(255,255,255,0.02)); color: #F3F6FB; font-size: 14px; font-weight: 600; box-shadow: inset 0 1px 0 rgba(255,255,255,0.03); appearance: none; -webkit-appearance: none; transition: background var(--motion), border-color var(--motion), color var(--motion);"
     } else {
-        "padding: 14px 16px; border-radius: 20px; border: 1px solid transparent; background: #8AB4F8; color: #0B1220; font-size: 14px; font-weight: 600; transition: background var(--motion), border-color var(--motion);"
+        "padding: 14px 16px; border-radius: 20px; border: 1px solid transparent; background: #8AB4F8; color: #0B1220; font-size: 14px; font-weight: 600; box-shadow: inset 0 1px 0 rgba(255,255,255,0.14); appearance: none; -webkit-appearance: none; transition: background var(--motion), border-color var(--motion), color var(--motion);"
     }
 }
 

@@ -28,6 +28,7 @@ pub struct LaunchConfig {
     pub quic_max_connection_receive_window: Option<String>,
     pub quic_max_idle_timeout: Option<String>,
     pub quic_keep_alive_period: Option<String>,
+    pub local_udp_enabled: Option<bool>,
     pub quic_disable_path_mtu_discovery: Option<bool>,
     pub insecure_tls: Option<bool>,
     pub auto_connect: Option<bool>,
@@ -245,7 +246,7 @@ mod imp {
                 activity,
                 jni_str!("startManagedVpnFieldsFromRust"),
                 jni_sig!(
-                    "(Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;ZZLjava/lang/String;I)V"
+                    "(Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;ZZZLjava/lang/String;I)V"
                 ),
                 &[
                     JValue::Object(&JObject::from(server)),
@@ -262,6 +263,7 @@ mod imp {
                     JValue::Object(&JObject::from(quic_max_connection_receive_window)),
                     JValue::Object(&JObject::from(quic_max_idle_timeout)),
                     JValue::Object(&JObject::from(quic_keep_alive_period)),
+                    JValue::Bool(form.local_udp_enabled.into()),
                     JValue::Bool(form.quic_disable_path_mtu_discovery.into()),
                     JValue::Bool(form.insecure_tls.into()),
                     JValue::Object(&JObject::from(host)),
@@ -567,6 +569,11 @@ mod imp {
                     activity,
                     "io.hysteria.mobile.extra.QUIC_KEEP_ALIVE_PERIOD",
                 )?,
+                local_udp_enabled: Some(launch_bool_extra(
+                    env,
+                    activity,
+                    "io.hysteria.mobile.extra.LOCAL_UDP_ENABLED",
+                )?),
                 quic_disable_path_mtu_discovery: Some(launch_bool_extra(
                     env,
                     activity,
@@ -604,6 +611,12 @@ mod imp {
                 directory,
                 files: parse_ca_listing(&listing),
             })
+        })
+    }
+
+    pub fn system_ca_pem_bundle() -> Result<String> {
+        with_main_activity(|env, activity| {
+            activity_string_method(env, activity, "systemCaPemBundleFromRust")
         })
     }
 
@@ -715,6 +728,8 @@ mod imp {
             let quic_keep_alive_period =
                 saved_profile_string(env, activity, "profile.quic.keep_alive_period")?
                     .unwrap_or_default();
+            let local_udp_enabled =
+                saved_profile_bool(env, activity, "profile.local_udp_enabled", true)?;
             let quic_disable_path_mtu_discovery = saved_profile_bool(
                 env,
                 activity,
@@ -737,6 +752,7 @@ mod imp {
                 && quic_max_connection_receive_window.trim().is_empty()
                 && quic_max_idle_timeout.trim().is_empty()
                 && quic_keep_alive_period.trim().is_empty()
+                && local_udp_enabled
                 && !quic_disable_path_mtu_discovery
                 && insecure_tls
             {
@@ -759,6 +775,7 @@ mod imp {
                 quic_max_connection_receive_window,
                 quic_max_idle_timeout,
                 quic_keep_alive_period,
+                local_udp_enabled,
                 quic_disable_path_mtu_discovery,
                 insecure_tls,
             }))
@@ -814,7 +831,7 @@ mod imp {
                 activity,
                 jni_str!("saveProfileFromRust"),
                 jni_sig!(
-                    "(Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;ZZ)V"
+                    "(Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;ZZZ)V"
                 ),
                 &[
                     JValue::Object(&JObject::from(server)),
@@ -831,6 +848,7 @@ mod imp {
                     JValue::Object(&JObject::from(quic_max_connection_receive_window)),
                     JValue::Object(&JObject::from(quic_max_idle_timeout)),
                     JValue::Object(&JObject::from(quic_keep_alive_period)),
+                    JValue::Bool(form.local_udp_enabled.into()),
                     JValue::Bool(form.quic_disable_path_mtu_discovery.into()),
                     JValue::Bool(form.insecure_tls.into()),
                 ],
@@ -907,6 +925,12 @@ mod imp {
 
     pub fn query_ca_catalog() -> Result<CaCatalog> {
         Ok(CaCatalog::default())
+    }
+
+    pub fn system_ca_pem_bundle() -> Result<String> {
+        Err(anyhow!(
+            "Android system certificate store is only available on Android"
+        ))
     }
 
     pub fn request_config_import() -> Result<()> {
@@ -996,6 +1020,10 @@ pub fn query_launch_config() -> Result<LaunchConfig> {
 
 pub fn query_ca_catalog() -> Result<CaCatalog> {
     imp::query_ca_catalog()
+}
+
+pub fn system_ca_pem_bundle() -> Result<String> {
+    imp::system_ca_pem_bundle()
 }
 
 pub fn request_config_import() -> Result<()> {

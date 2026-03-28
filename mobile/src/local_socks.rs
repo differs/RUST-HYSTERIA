@@ -1,15 +1,18 @@
 use std::{
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
     sync::Arc,
+    time::Instant,
 };
 
-use anyhow::{Context, Result, bail};
-use hysteria_core::{Client, UdpSession};
+use anyhow::{Context, Result, anyhow, bail};
+use hysteria_core::{Client, CoreError, UdpSession};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt, copy_bidirectional},
     net::{TcpListener, TcpStream, UdpSocket},
     sync::Mutex,
 };
+
+use crate::dns_proxy::{DnsProxy, DnsProxyTransport};
 
 #[derive(Clone, Debug)]
 pub struct LocalSocksConfig {
@@ -17,7 +20,10 @@ pub struct LocalSocksConfig {
     pub username: String,
     pub password: String,
     pub disable_udp: bool,
+    pub dns_proxy: Option<Arc<DnsProxy>>,
 }
+
+pub type FatalConnectionNotifier = Arc<dyn Fn(String) + Send + Sync>;
 
 const SOCKS5_VERSION: u8 = 0x05;
 const SOCKS5_METHOD_NONE: u8 = 0x00;
@@ -35,7 +41,11 @@ const USERPASS_VERSION: u8 = 0x01;
 const USERPASS_STATUS_SUCCESS: u8 = 0x00;
 const USERPASS_STATUS_FAILURE: u8 = 0x01;
 
-pub async fn serve_socks5(config: LocalSocksConfig, client: Client) -> Result<()> {
+pub async fn serve_socks5(
+    config: LocalSocksConfig,
+    client: Client,
+    fatal_notifier: Option<FatalConnectionNotifier>,
+) -> Result<()> {
     let listener = TcpListener::bind(&config.listen)
         .await
         .with_context(|| format!("failed to bind SOCKS5 listener {}", config.listen))?;
@@ -51,11 +61,51 @@ pub async fn serve_socks5(config: LocalSocksConfig, client: Client) -> Result<()
         let client = client.clone();
         let auth = auth.clone();
         let disable_udp = config.disable_udp;
+        let dns_proxy = config.dns_proxy.clone();
+        let fatal_notifier = fatal_notifier.clone();
         tokio::spawn(async move {
-            if let Err(err) = handle_client(stream, client, auth, disable_udp).await {
+            if let Err(err) = handle_client(stream, client, auth, disable_udp, dns_proxy).await {
+                if let Some(reason) = connection_recovery_reason(&err)
+                    && let Some(notifier) = fatal_notifier.as_ref()
+                {
+                    notifier(reason);
+                }
                 eprintln!("SOCKS5 connection {peer_addr} failed: {err:#}");
             }
         });
+    }
+}
+
+fn connection_recovery_reason_from_core(core: &CoreError) -> Option<String> {
+    match core {
+        CoreError::Closed(reason) => Some(format!("connection closed: {reason}")),
+        CoreError::Transport(reason) => Some(format!("connection transport failed: {reason}")),
+        CoreError::Connect(reason) => Some(format!("connection connect failed: {reason}")),
+        CoreError::Dial(_)
+        | CoreError::Authentication(_)
+        | CoreError::Config(_)
+        | CoreError::Protocol(_)
+        | CoreError::UnexpectedFrameType(_)
+        | CoreError::Tls(_) => None,
+    }
+}
+
+pub fn connection_recovery_reason(err: &anyhow::Error) -> Option<String> {
+    for cause in err.chain() {
+        if let Some(core) = cause.downcast_ref::<CoreError>() {
+            if let Some(reason) = connection_recovery_reason_from_core(core) {
+                return Some(reason);
+            }
+        }
+    }
+    None
+}
+
+fn relay_failure(error: std::io::Error, close_reason: Option<String>, context: &str) -> anyhow::Error {
+    if let Some(reason) = close_reason {
+        anyhow!(CoreError::Closed(reason)).context(context.to_string())
+    } else {
+        anyhow!(error).context(context.to_string())
     }
 }
 
@@ -64,12 +114,17 @@ async fn handle_client(
     client: Client,
     auth: Option<(String, String)>,
     disable_udp: bool,
+    dns_proxy: Option<Arc<DnsProxy>>,
 ) -> Result<()> {
     negotiate(&mut stream, auth.as_ref()).await?;
     let request = read_request(&mut stream).await?;
     match request.command {
-        SOCKS5_CMD_CONNECT => handle_connect(stream, client, &request.address).await,
-        SOCKS5_CMD_UDP_ASSOCIATE if !disable_udp => handle_udp_associate(stream, client).await,
+        SOCKS5_CMD_CONNECT => handle_connect(stream, client, &request.address, dns_proxy).await,
+        SOCKS5_CMD_UDP_ASSOCIATE
+            if should_accept_udp_associate(disable_udp, dns_proxy.is_some()) =>
+        {
+            handle_udp_associate(stream, client, dns_proxy, !disable_udp).await
+        }
         _ => {
             write_reply(&mut stream, SOCKS5_REP_COMMAND_NOT_SUPPORTED, None).await?;
             Ok(())
@@ -182,21 +237,93 @@ async fn read_address(stream: &mut TcpStream, atyp: u8) -> Result<String> {
     Ok(format!("{host}:{port}"))
 }
 
-async fn handle_connect(mut stream: TcpStream, client: Client, address: &str) -> Result<()> {
+async fn handle_connect(
+    mut stream: TcpStream,
+    client: Client,
+    address: &str,
+    dns_proxy: Option<Arc<DnsProxy>>,
+) -> Result<()> {
+    if let Some(dns_proxy) = dns_proxy.as_ref() {
+        match dns_proxy.match_destination(address) {
+            Some(DnsProxyTransport::Plain) => {
+                write_reply(&mut stream, SOCKS5_REP_SUCCESS, None).await?;
+                return handle_dns_over_tcp(stream, dns_proxy.clone()).await;
+            }
+            Some(DnsProxyTransport::Dot) => {
+                write_reply(&mut stream, SOCKS5_REP_SUCCESS, None).await?;
+                return handle_dns_over_tls(stream, dns_proxy.clone()).await;
+            }
+            None => {}
+        }
+    }
+
+    let started_at = Instant::now();
     match client.tcp(address).await {
         Ok(mut remote) => {
+            eprintln!(
+                "SOCKS5 CONNECT target={address} established in {} ms",
+                started_at.elapsed().as_millis()
+            );
             write_reply(&mut stream, SOCKS5_REP_SUCCESS, None).await?;
-            let _ = copy_bidirectional(&mut stream, &mut remote).await;
-            Ok(())
+            match copy_bidirectional(&mut stream, &mut remote).await {
+                Ok(_) => Ok(()),
+                Err(err) => Err(relay_failure(
+                    err,
+                    client.close_reason_text(),
+                    &format!("SOCKS5 CONNECT relay failed for {address}"),
+                )),
+            }
         }
         Err(err) => {
+            eprintln!(
+                "SOCKS5 CONNECT target={address} failed after {} ms: {err:#}",
+                started_at.elapsed().as_millis()
+            );
             write_reply(&mut stream, SOCKS5_REP_HOST_UNREACHABLE, None).await?;
             Err(err.into())
         }
     }
 }
 
-async fn handle_udp_associate(mut control: TcpStream, client: Client) -> Result<()> {
+async fn handle_dns_over_tcp(mut stream: TcpStream, dns_proxy: Arc<DnsProxy>) -> Result<()> {
+    loop {
+        let mut len_buf = [0_u8; 2];
+        let read = stream.read(&mut len_buf[..1]).await?;
+        if read == 0 {
+            return Ok(());
+        }
+        stream.read_exact(&mut len_buf[1..]).await?;
+
+        let query_len = u16::from_be_bytes(len_buf) as usize;
+        let mut query = vec![0_u8; query_len];
+        stream.read_exact(&mut query).await?;
+
+        let response = dns_proxy.resolve_raw(&query).await?;
+        let response_len = u16::try_from(response.len())
+            .map_err(|_| anyhow!("DNS-over-TCP response exceeds frame size"))?;
+        stream.write_all(&response_len.to_be_bytes()).await?;
+        stream.write_all(&response).await?;
+        stream
+            .flush()
+            .await
+            .map_err(|err| relay_failure(err, dns_proxy.connection_close_reason(), "DNS-over-TCP flush failed"))?;
+    }
+}
+
+async fn handle_dns_over_tls(mut stream: TcpStream, dns_proxy: Arc<DnsProxy>) -> Result<()> {
+    let mut remote = dns_proxy.open_dot_upstream().await?;
+    copy_bidirectional(&mut stream, &mut remote)
+        .await
+        .map_err(|err| relay_failure(err, dns_proxy.connection_close_reason(), "DNS-over-TLS relay failed"))?;
+    Ok(())
+}
+
+async fn handle_udp_associate(
+    mut control: TcpStream,
+    client: Client,
+    dns_proxy: Option<Arc<DnsProxy>>,
+    allow_non_dns_udp: bool,
+) -> Result<()> {
     let bind_ip = control
         .local_addr()
         .context("failed to read SOCKS5 local address")?
@@ -206,7 +333,11 @@ async fn handle_udp_associate(mut control: TcpStream, client: Client) -> Result<
             .await
             .context("failed to bind SOCKS5 UDP socket")?,
     );
-    let hy_udp = client.udp().context("failed to open proxied UDP session")?;
+    let hy_udp = if allow_non_dns_udp {
+        Some(client.udp().context("failed to open proxied UDP session")?)
+    } else {
+        None
+    };
 
     write_reply(
         &mut control,
@@ -225,11 +356,7 @@ async fn handle_udp_associate(mut control: TcpStream, client: Client) -> Result<
         udp_socket.clone(),
         hy_udp.clone(),
         client_addr.clone(),
-    ));
-    let mut remote_task = tokio::spawn(udp_remote_to_local(
-        udp_socket.clone(),
-        hy_udp.clone(),
-        client_addr,
+        dns_proxy,
     ));
     let mut control_task = tokio::spawn(async move {
         let mut buf = [0_u8; 1024];
@@ -241,23 +368,37 @@ async fn handle_udp_associate(mut control: TcpStream, client: Client) -> Result<
         }
     });
 
-    let result = tokio::select! {
-        joined = &mut local_task => joined.context("SOCKS5 UDP upload task panicked")?,
-        joined = &mut remote_task => joined.context("SOCKS5 UDP download task panicked")?,
-        joined = &mut control_task => joined.context("SOCKS5 control task panicked")?,
+    let result = if let Some(hy_udp) = hy_udp.clone() {
+        let mut remote_task = tokio::spawn(udp_remote_to_local(
+            udp_socket.clone(),
+            hy_udp.clone(),
+            client_addr,
+        ));
+        let result = tokio::select! {
+            joined = &mut local_task => joined.context("SOCKS5 UDP upload task panicked")?,
+            joined = &mut remote_task => joined.context("SOCKS5 UDP download task panicked")?,
+            joined = &mut control_task => joined.context("SOCKS5 control task panicked")?,
+        };
+        remote_task.abort();
+        let _ = hy_udp.close().await;
+        result
+    } else {
+        tokio::select! {
+            joined = &mut local_task => joined.context("SOCKS5 DNS-only UDP task panicked")?,
+            joined = &mut control_task => joined.context("SOCKS5 control task panicked")?,
+        }
     };
 
     local_task.abort();
-    remote_task.abort();
     control_task.abort();
-    let _ = hy_udp.close().await;
     result
 }
 
 async fn udp_local_to_remote(
     udp_socket: Arc<UdpSocket>,
-    hy_udp: UdpSession,
+    hy_udp: Option<UdpSession>,
     client_addr: Arc<Mutex<Option<SocketAddr>>>,
+    dns_proxy: Option<Arc<DnsProxy>>,
 ) -> Result<()> {
     let mut buffer = [0_u8; 4096];
     loop {
@@ -274,8 +415,26 @@ async fn udp_local_to_remote(
         }
         drop(client);
 
-        hy_udp.send(&payload, &destination).await?;
+        if let Some(dns_proxy) = dns_proxy.as_ref() {
+            if dns_proxy.match_destination(&destination) == Some(DnsProxyTransport::Plain) {
+                let response = dns_proxy.resolve_raw(&payload).await?;
+                let packet = build_udp_datagram(&destination, &response)?;
+                udp_socket.send_to(&packet, peer_addr).await?;
+                continue;
+            }
+        }
+
+        if let Some(hy_udp) = hy_udp.as_ref() {
+            hy_udp
+                .send(&payload, &destination)
+                .await
+                .map_err(|err| anyhow!(err).context("SOCKS5 UDP upload failed"))?;
+        }
     }
+}
+
+fn should_accept_udp_associate(disable_udp: bool, has_dns_proxy: bool) -> bool {
+    !disable_udp || has_dns_proxy
 }
 
 async fn udp_remote_to_local(
@@ -284,7 +443,10 @@ async fn udp_remote_to_local(
     client_addr: Arc<Mutex<Option<SocketAddr>>>,
 ) -> Result<()> {
     loop {
-        let (payload, from_addr) = hy_udp.receive().await?;
+        let (payload, from_addr) = hy_udp
+            .receive()
+            .await
+            .map_err(|err| anyhow!(err).context("SOCKS5 UDP download failed"))?;
         let packet = build_udp_datagram(&from_addr, &payload)?;
         let target = { *client_addr.lock().await };
         if let Some(target) = target {
@@ -415,4 +577,72 @@ fn split_host_port(address: &str) -> Result<(String, u16)> {
         port.parse()
             .with_context(|| format!("invalid port in address {address}"))?,
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use anyhow::anyhow;
+    use hysteria_core::CoreError;
+
+    #[test]
+    fn reconnect_reason_detects_wrapped_transport_failures() {
+        let err = anyhow!(CoreError::Transport("timed out".to_string()))
+            .context("SOCKS5 CONNECT relay failed");
+
+        assert_eq!(
+            connection_recovery_reason(&err).as_deref(),
+            Some("connection transport failed: timed out")
+        );
+    }
+
+    #[test]
+    fn reconnect_reason_detects_closed_connections() {
+        let err =
+            anyhow!(CoreError::Closed("peer dropped connection".to_string())).context("UDP relay");
+
+        assert_eq!(
+            connection_recovery_reason(&err).as_deref(),
+            Some("connection closed: peer dropped connection")
+        );
+    }
+
+    #[test]
+    fn reconnect_reason_ignores_remote_dial_failures() {
+        let err = anyhow!(CoreError::Dial("failed to resolve udp target example.com:53".into()));
+
+        assert_eq!(connection_recovery_reason(&err), None);
+    }
+
+    #[test]
+    fn relay_failure_promotes_known_close_reason_into_reconnectable_error() {
+        let err = relay_failure(
+            std::io::Error::other("stream reset"),
+            Some("timed out".to_string()),
+            "SOCKS5 relay failed",
+        );
+
+        assert_eq!(
+            connection_recovery_reason(&err).as_deref(),
+            Some("connection closed: timed out")
+        );
+    }
+
+    #[test]
+    fn relay_failure_keeps_plain_io_errors_non_reconnectable_when_connection_stays_open() {
+        let err = relay_failure(
+            std::io::Error::other("broken pipe"),
+            None,
+            "SOCKS5 relay failed",
+        );
+
+        assert_eq!(connection_recovery_reason(&err), None);
+    }
+
+    #[test]
+    fn udp_associate_stays_available_for_dns_when_general_udp_is_disabled() {
+        assert!(should_accept_udp_associate(true, true));
+        assert!(!should_accept_udp_associate(true, false));
+        assert!(should_accept_udp_associate(false, false));
+    }
 }

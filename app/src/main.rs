@@ -20,7 +20,7 @@ use config::{
     load_client_config, load_server_config,
 };
 use http_proxy::serve_http_proxy;
-use hysteria_core::{Client, Server};
+use hysteria_core::{Client, Server, run_client_health_check};
 use share::{build_share_config_yaml, build_share_uri, render_qr};
 use socks5::serve_socks5;
 use speedtest::run_speedtest_command;
@@ -52,6 +52,36 @@ async fn execute(cli: Cli, meta: AppMetadata) -> Result<()> {
     }
 }
 
+const CLIENT_HEALTH_PROBE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(15);
+const CLIENT_HEALTH_PROBE_FAILURE_THRESHOLD: u32 = 2;
+
+fn should_run_client_health_probe(has_listener_runtime: bool) -> bool {
+    has_listener_runtime
+}
+
+fn client_access_hints(
+    socks5_enabled: bool,
+    http_enabled: bool,
+    server_udp_enabled: bool,
+) -> Vec<&'static str> {
+    let mut hints = Vec::new();
+    if socks5_enabled {
+        if server_udp_enabled {
+            hints.push("access hint: use SOCKS5 for HTTP/3/QUIC sites; UDP relay is ready");
+        } else {
+            hints.push(
+                "access hint: SOCKS5 is available, but server UDP is disabled; HTTP/3/QUIC sites may fall back or fail",
+            );
+        }
+    }
+    if http_enabled {
+        hints.push(
+            "access hint: the built-in HTTP proxy is TCP-only; it does not carry native HTTP/3/QUIC",
+        );
+    }
+    hints
+}
+
 async fn run_client(cli: &Cli, _meta: &AppMetadata, args: &ClientArgs) -> Result<()> {
     let loaded = load_client_config(cli.config.as_deref())?;
     let runtime = build_runnable_client_config(&loaded.value)?;
@@ -71,6 +101,12 @@ async fn run_client(cli: &Cli, _meta: &AppMetadata, args: &ClientArgs) -> Result
         let uri = build_share_uri(&loaded.value).context("failed to build share URI")?;
         println!("share URI: {uri}");
         println!("{}", render_qr(&uri).context("failed to render QR code")?);
+    }
+
+    let socks5_enabled = runtime.socks5.is_some();
+    let http_enabled = runtime.http.is_some();
+    for hint in client_access_hints(socks5_enabled, http_enabled, info.udp_enabled) {
+        println!("{hint}");
     }
 
     let mut listeners = JoinSet::new();
@@ -98,6 +134,28 @@ async fn run_client(cli: &Cli, _meta: &AppMetadata, args: &ClientArgs) -> Result
     for entry in runtime.udp_forwarding {
         let client = client.clone();
         listeners.spawn(async move { serve_udp_forwarder(entry, client).await });
+    }
+    if should_run_client_health_probe(!listeners.is_empty()) {
+        let client = client.clone();
+        listeners.spawn(async move {
+            let mut failures = 0_u32;
+            loop {
+                tokio::time::sleep(CLIENT_HEALTH_PROBE_INTERVAL).await;
+                match run_client_health_check(&client).await {
+                    Ok(_) => failures = 0,
+                    Err(err) => {
+                        failures = failures.saturating_add(1);
+                        eprintln!(
+                            "client health probe failed ({failures}/{}): {err}",
+                            CLIENT_HEALTH_PROBE_FAILURE_THRESHOLD
+                        );
+                        if failures >= CLIENT_HEALTH_PROBE_FAILURE_THRESHOLD {
+                            return Err(err.into());
+                        }
+                    }
+                }
+            }
+        });
     }
 
     let result = tokio::select! {
@@ -363,7 +421,7 @@ async fn serve_tcp_forwarder(listener: TcpListener, client: Client, remote: Stri
 
 #[cfg(test)]
 mod tests {
-    use super::build_share_output;
+    use super::{build_share_output, client_access_hints, should_run_client_health_probe};
     use crate::{
         cli::ShareArgs,
         config::{ClientConfig, ClientTlsConfig, WireGuardForwardingEntry},
@@ -394,5 +452,31 @@ mod tests {
         assert!(!output.contains("hysteria2://"));
         assert!(output.contains("wireguardForwarding:"));
         assert!(output.contains("mtu: 1280"));
+    }
+
+    #[test]
+    fn client_health_probe_requires_active_listener_runtime() {
+        assert!(!should_run_client_health_probe(false));
+        assert!(should_run_client_health_probe(true));
+    }
+
+    #[test]
+    fn client_access_hints_prefer_socks5_for_http3_when_udp_is_ready() {
+        let hints = client_access_hints(true, true, true);
+
+        assert!(hints
+            .iter()
+            .any(|hint| hint.contains("use SOCKS5 for HTTP/3/QUIC sites")));
+        assert!(hints
+            .iter()
+            .any(|hint| hint.contains("HTTP proxy is TCP-only")));
+    }
+
+    #[test]
+    fn client_access_hints_warn_when_socks5_has_no_udp() {
+        let hints = client_access_hints(true, false, false);
+
+        assert_eq!(hints.len(), 1);
+        assert!(hints[0].contains("server UDP is disabled"));
     }
 }

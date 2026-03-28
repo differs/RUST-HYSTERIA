@@ -427,3 +427,213 @@ fn split_host_port(address: &str) -> Result<(String, u16)> {
             .with_context(|| format!("invalid port in address {address}"))?,
     ))
 }
+
+#[cfg(test)]
+pub(crate) fn test_build_udp_datagram(address: &str, payload: &[u8]) -> Result<Vec<u8>> {
+    build_udp_datagram(address, payload)
+}
+
+#[cfg(test)]
+pub(crate) fn test_parse_udp_datagram(buf: &[u8]) -> Result<Option<(String, Vec<u8>)>> {
+    parse_udp_datagram(buf)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{sync::Arc, time::Duration};
+
+    use hysteria_core::{
+        Client, ClientConfig, PasswordAuthenticator, QuicTransportConfig, Server, ServerConfig,
+    };
+    use rcgen::{CertifiedKey, generate_simple_self_signed};
+    use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
+    use tokio::{
+        io::{AsyncReadExt, AsyncWriteExt},
+        net::{TcpListener, TcpStream, UdpSocket},
+    };
+
+    use super::{
+        SOCKS5_ATYP_IPV4, SOCKS5_CMD_UDP_ASSOCIATE, SOCKS5_METHOD_NONE, SOCKS5_REP_SUCCESS,
+        SOCKS5_VERSION, handle_client, test_build_udp_datagram, test_parse_udp_datagram,
+    };
+
+    fn tls_material() -> (
+        Vec<CertificateDer<'static>>,
+        PrivateKeyDer<'static>,
+        CertificateDer<'static>,
+    ) {
+        let CertifiedKey { cert, key_pair } =
+            generate_simple_self_signed(vec!["localhost".to_string()])
+                .expect("generate certificate");
+        let cert_der = cert.der().clone();
+        let key = PrivatePkcs8KeyDer::from(key_pair.serialize_der());
+        (vec![cert_der.clone()], key.into(), cert_der)
+    }
+
+    async fn spawn_hysteria_server(
+        password: &str,
+    ) -> (
+        Arc<Server>,
+        tokio::task::JoinHandle<()>,
+        CertificateDer<'static>,
+    ) {
+        let (certificates, private_key, certificate) = tls_material();
+        let server = Arc::new(
+            Server::bind(ServerConfig {
+                bind_addr: "127.0.0.1:0".parse().unwrap(),
+                certificates,
+                private_key,
+                authenticator: Arc::new(PasswordAuthenticator::new(password)),
+                obfs: None,
+                speed_test: false,
+                disable_udp: false,
+                udp_idle_timeout: Duration::from_secs(60),
+                bandwidth_max_tx: 0,
+                bandwidth_max_rx: 0,
+                ignore_client_bandwidth: false,
+                quic: QuicTransportConfig::server_default(),
+            })
+            .await
+            .expect("bind hysteria server"),
+        );
+        let task_server = server.clone();
+        let task = tokio::spawn(async move {
+            task_server.serve().await.expect("serve hysteria server");
+        });
+        (server, task, certificate)
+    }
+
+    async fn spawn_udp_echo_server() -> (std::net::SocketAddr, tokio::task::JoinHandle<()>) {
+        let socket = UdpSocket::bind("127.0.0.1:0")
+            .await
+            .expect("bind udp echo socket");
+        let addr = socket.local_addr().expect("udp echo local addr");
+        let task = tokio::spawn(async move {
+            let mut buf = [0_u8; 4096];
+            loop {
+                let (size, peer) = match socket.recv_from(&mut buf).await {
+                    Ok(pair) => pair,
+                    Err(_) => break,
+                };
+                let _ = socket.send_to(&buf[..size], peer).await;
+            }
+        });
+        (addr, task)
+    }
+
+    async fn connect_hysteria_client(
+        server_addr: std::net::SocketAddr,
+        certificate: CertificateDer<'static>,
+    ) -> Client {
+        let mut client_config = ClientConfig::new(server_addr, "localhost");
+        client_config.auth = "hunter2".into();
+        client_config.tls.root_certificates = vec![certificate];
+        let (client, info) = Client::connect(client_config)
+            .await
+            .expect("connect hysteria client");
+        assert!(info.udp_enabled);
+        client
+    }
+
+    async fn spawn_socks5_session(client: Client) -> (TcpStream, std::net::SocketAddr) {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind socks5 listener");
+        let listen_addr = listener.local_addr().expect("socks5 local addr");
+        let task_client = client.clone();
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept socks5 client");
+            if let Err(err) = handle_client(stream, task_client, None, false).await {
+                let message = err.to_string();
+                assert!(
+                    message.contains("udp session closed") || message.contains("closed"),
+                    "serve socks5 session: {err:#}"
+                );
+            }
+        });
+
+        let mut control = TcpStream::connect(listen_addr)
+            .await
+            .expect("connect to socks5 listener");
+        control
+            .write_all(&[SOCKS5_VERSION, 1, SOCKS5_METHOD_NONE])
+            .await
+            .expect("write greeting");
+        let mut negotiate_reply = [0_u8; 2];
+        control
+            .read_exact(&mut negotiate_reply)
+            .await
+            .expect("read greeting reply");
+        assert_eq!(negotiate_reply, [SOCKS5_VERSION, SOCKS5_METHOD_NONE]);
+
+        let request = [
+            SOCKS5_VERSION,
+            SOCKS5_CMD_UDP_ASSOCIATE,
+            0,
+            SOCKS5_ATYP_IPV4,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+        ];
+        control
+            .write_all(&request)
+            .await
+            .expect("write udp associate");
+
+        let mut reply = [0_u8; 10];
+        control
+            .read_exact(&mut reply)
+            .await
+            .expect("read udp associate reply");
+        assert_eq!(reply[0], SOCKS5_VERSION);
+        assert_eq!(reply[1], SOCKS5_REP_SUCCESS);
+        assert_eq!(reply[3], SOCKS5_ATYP_IPV4);
+        let relay_addr = std::net::SocketAddr::from((
+            std::net::Ipv4Addr::new(reply[4], reply[5], reply[6], reply[7]),
+            u16::from_be_bytes([reply[8], reply[9]]),
+        ));
+        (control, relay_addr)
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn socks5_udp_associate_roundtrip_works() {
+        let (server, server_task, certificate) = spawn_hysteria_server("hunter2").await;
+        let (echo_addr, echo_task) = spawn_udp_echo_server().await;
+        let client = connect_hysteria_client(server.local_addr().unwrap(), certificate).await;
+
+        let (control, relay_addr) = spawn_socks5_session(client.clone()).await;
+        let udp_client = UdpSocket::bind("127.0.0.1:0")
+            .await
+            .expect("bind udp client");
+        let payload = b"h3-probe";
+        let packet =
+            test_build_udp_datagram(&echo_addr.to_string(), payload).expect("build udp datagram");
+        udp_client
+            .send_to(&packet, relay_addr)
+            .await
+            .expect("send udp packet");
+
+        let mut buf = [0_u8; 4096];
+        let (size, _) = udp_client
+            .recv_from(&mut buf)
+            .await
+            .expect("receive udp echo");
+        let (from, echoed_payload) = test_parse_udp_datagram(&buf[..size])
+            .expect("parse udp datagram")
+            .expect("udp datagram payload");
+        assert_eq!(from, echo_addr.to_string());
+        assert_eq!(echoed_payload, payload);
+
+        drop(control);
+        client.close().await.expect("close client");
+        server.close();
+        let joined = tokio::time::timeout(Duration::from_secs(2), server_task)
+            .await
+            .expect("server task timed out");
+        joined.expect("server task join");
+        echo_task.abort();
+    }
+}

@@ -110,6 +110,21 @@ netif_init_handler (struct netif *netif)
     return ERR_OK;
 }
 
+static int
+udp_listener_required (void)
+{
+    HevConfigServer *srv = hev_config_get_socks5_server ();
+    int cache_size = hev_config_get_mapdns_cache_size ();
+
+    if (!srv)
+        return 1;
+
+    if (!srv->udp_disabled)
+        return 1;
+
+    return cache_size > 0;
+}
+
 static void
 hev_socks5_session_task_entry (void *data)
 {
@@ -428,10 +443,13 @@ gateway_init (void)
     tcp = tcp_listen (tcp);
     tcp_accept (tcp, tcp_accept_handler);
 
-    udp = udp_new_ip_type (IPADDR_TYPE_ANY);
-    udp_bind_netif (udp, &netif);
-    udp_bind (udp, NULL, 0);
-    udp_recv (udp, udp_recv_handler, NULL);
+    udp = NULL;
+    if (udp_listener_required ()) {
+        udp = udp_new_ip_type (IPADDR_TYPE_ANY);
+        udp_bind_netif (udp, &netif);
+        udp_bind (udp, NULL, 0);
+        udp_recv (udp, udp_recv_handler, NULL);
+    }
 
     return 0;
 }
@@ -439,7 +457,10 @@ gateway_init (void)
 static void
 gateway_fini (void)
 {
-    udp_remove (udp);
+    if (udp) {
+        udp_remove (udp);
+        udp = NULL;
+    }
     tcp_close (tcp);
     netif_remove (&netif);
 }

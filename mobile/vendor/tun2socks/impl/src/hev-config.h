@@ -17,6 +17,7 @@ struct _HevConfigServer
     const char *user;
     const char *pass;
     unsigned int mark;
+    short udp_disabled;
     short udp_in_udp;
     unsigned short port;
     unsigned char pipeline;

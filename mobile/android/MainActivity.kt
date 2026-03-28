@@ -12,10 +12,13 @@ import android.os.Build
 import android.os.Bundle
 import android.os.ParcelFileDescriptor
 import android.provider.OpenableColumns
+import android.util.Base64
 import android.util.Log
 import androidx.core.app.NotificationCompat
 import java.io.File
 import java.io.IOException
+import java.security.KeyStore
+import java.security.cert.X509Certificate
 import java.util.concurrent.atomic.AtomicBoolean
 
 private const val HY_LOG_TAG = "HysteriaMobile"
@@ -35,6 +38,7 @@ data class ManagedRuntimeProfile(
     val quicMaxConnectionReceiveWindow: String,
     val quicMaxIdleTimeout: String,
     val quicKeepAlivePeriod: String,
+    val localUdpEnabled: Boolean,
     val quicDisablePathMtuDiscovery: Boolean,
     val insecureTls: Boolean,
 )
@@ -48,6 +52,18 @@ data class ManagedRuntimeRecord(
 class MainActivity : WryActivity() {
     private fun log(message: String) {
         Log.i(HY_LOG_TAG, message)
+    }
+
+    private fun appendPemCertificate(output: StringBuilder, encoded: ByteArray) {
+        output.append("-----BEGIN CERTIFICATE-----\n")
+        val base64 = Base64.encodeToString(encoded, Base64.NO_WRAP)
+        var index = 0
+        while (index < base64.length) {
+            val end = minOf(index + 64, base64.length)
+            output.append(base64, index, end).append('\n')
+            index = end
+        }
+        output.append("-----END CERTIFICATE-----\n")
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -200,6 +216,7 @@ class MainActivity : WryActivity() {
         quicMaxConnectionReceiveWindow: String,
         quicMaxIdleTimeout: String,
         quicKeepAlivePeriod: String,
+        localUdpEnabled: Boolean,
         quicDisablePathMtuDiscovery: Boolean,
         insecureTls: Boolean,
         socksHost: String,
@@ -221,6 +238,7 @@ class MainActivity : WryActivity() {
                 quicMaxConnectionReceiveWindow = quicMaxConnectionReceiveWindow,
                 quicMaxIdleTimeout = quicMaxIdleTimeout,
                 quicKeepAlivePeriod = quicKeepAlivePeriod,
+                localUdpEnabled = localUdpEnabled,
                 quicDisablePathMtuDiscovery = quicDisablePathMtuDiscovery,
                 insecureTls = insecureTls,
             ),
@@ -244,6 +262,7 @@ class MainActivity : WryActivity() {
         quicMaxConnectionReceiveWindow: String,
         quicMaxIdleTimeout: String,
         quicKeepAlivePeriod: String,
+        localUdpEnabled: Boolean,
         quicDisablePathMtuDiscovery: Boolean,
         insecureTls: Boolean,
     ) {
@@ -264,6 +283,7 @@ class MainActivity : WryActivity() {
                 quicMaxConnectionReceiveWindow = quicMaxConnectionReceiveWindow,
                 quicMaxIdleTimeout = quicMaxIdleTimeout,
                 quicKeepAlivePeriod = quicKeepAlivePeriod,
+                localUdpEnabled = localUdpEnabled,
                 quicDisablePathMtuDiscovery = quicDisablePathMtuDiscovery,
                 insecureTls = insecureTls,
             ),
@@ -290,6 +310,23 @@ class MainActivity : WryActivity() {
         return HysteriaVpnService.listCaFiles(applicationContext).joinToString("\n") {
             "${it.name}\t${it.absolutePath}"
         }
+    }
+
+    fun systemCaPemBundleFromRust(): String {
+        val store = KeyStore.getInstance("AndroidCAStore")
+        store.load(null)
+
+        val output = StringBuilder()
+        val aliases = store.aliases()
+        var count = 0
+        while (aliases.hasMoreElements()) {
+            val alias = aliases.nextElement()
+            val certificate = store.getCertificate(alias) as? X509Certificate ?: continue
+            appendPemCertificate(output, certificate.encoded)
+            count += 1
+        }
+        log("systemCaPemBundleFromRust exported $count certificates from AndroidCAStore")
+        return output.toString()
     }
 
     fun launchConfigImportFromRust() {
@@ -484,6 +521,8 @@ class MainActivity : WryActivity() {
                 intent.getStringExtra("io.hysteria.mobile.extra.QUIC_MAX_IDLE_TIMEOUT") ?: ""
             launchStringExtras["io.hysteria.mobile.extra.QUIC_KEEP_ALIVE_PERIOD"] =
                 intent.getStringExtra("io.hysteria.mobile.extra.QUIC_KEEP_ALIVE_PERIOD") ?: ""
+            launchBooleanExtras["io.hysteria.mobile.extra.LOCAL_UDP_ENABLED"] =
+                intent.getBooleanExtra("io.hysteria.mobile.extra.LOCAL_UDP_ENABLED", true)
             launchBooleanExtras["io.hysteria.mobile.extra.INSECURE_TLS"] =
                 intent.getBooleanExtra("io.hysteria.mobile.extra.INSECURE_TLS", false)
             launchBooleanExtras["io.hysteria.mobile.extra.QUIC_DISABLE_PATH_MTU_DISCOVERY"] =
@@ -496,7 +535,7 @@ class MainActivity : WryActivity() {
                 intent.getBooleanExtra("io.hysteria.mobile.extra.AUTO_START_VPN", false)
             Log.i(
                 HY_LOG_TAG,
-                "cacheLaunchExtras server=${launchStringExtras["io.hysteria.mobile.extra.SERVER"]} auth=${launchStringExtras["io.hysteria.mobile.extra.AUTH"]?.let { if (it.isEmpty()) "<empty>" else "<set>" }} obfs=${launchStringExtras["io.hysteria.mobile.extra.OBFS_PASSWORD"]?.let { if (it.isEmpty()) "<empty>" else "<set>" }} bandwidthUp=${launchStringExtras["io.hysteria.mobile.extra.BANDWIDTH_UP"]?.ifEmpty { "<empty>" }} bandwidthDown=${launchStringExtras["io.hysteria.mobile.extra.BANDWIDTH_DOWN"]?.ifEmpty { "<empty>" }} insecure=${launchBooleanExtras["io.hysteria.mobile.extra.INSECURE_TLS"]} pmtudOff=${launchBooleanExtras["io.hysteria.mobile.extra.QUIC_DISABLE_PATH_MTU_DISCOVERY"]} autoConnect=${launchBooleanExtras["io.hysteria.mobile.extra.AUTO_CONNECT"]} autoRequestVpn=${launchBooleanExtras["io.hysteria.mobile.extra.AUTO_REQUEST_VPN"]} autoStartVpn=${launchBooleanExtras["io.hysteria.mobile.extra.AUTO_START_VPN"]}"
+                "cacheLaunchExtras server=${launchStringExtras["io.hysteria.mobile.extra.SERVER"]} auth=${launchStringExtras["io.hysteria.mobile.extra.AUTH"]?.let { if (it.isEmpty()) "<empty>" else "<set>" }} obfs=${launchStringExtras["io.hysteria.mobile.extra.OBFS_PASSWORD"]?.let { if (it.isEmpty()) "<empty>" else "<set>" }} bandwidthUp=${launchStringExtras["io.hysteria.mobile.extra.BANDWIDTH_UP"]?.ifEmpty { "<empty>" }} bandwidthDown=${launchStringExtras["io.hysteria.mobile.extra.BANDWIDTH_DOWN"]?.ifEmpty { "<empty>" }} localUdp=${launchBooleanExtras["io.hysteria.mobile.extra.LOCAL_UDP_ENABLED"]} insecure=${launchBooleanExtras["io.hysteria.mobile.extra.INSECURE_TLS"]} pmtudOff=${launchBooleanExtras["io.hysteria.mobile.extra.QUIC_DISABLE_PATH_MTU_DISCOVERY"]} autoConnect=${launchBooleanExtras["io.hysteria.mobile.extra.AUTO_CONNECT"]} autoRequestVpn=${launchBooleanExtras["io.hysteria.mobile.extra.AUTO_REQUEST_VPN"]} autoStartVpn=${launchBooleanExtras["io.hysteria.mobile.extra.AUTO_START_VPN"]}"
             )
         }
 
@@ -557,6 +596,7 @@ class MainActivity : WryActivity() {
             quicMaxConnectionReceiveWindow: String,
             quicMaxIdleTimeout: String,
             quicKeepAlivePeriod: String,
+            localUdpEnabled: Boolean,
             quicDisablePathMtuDiscovery: Boolean,
             insecureTls: Boolean,
             socksHost: String,
@@ -577,6 +617,7 @@ class MainActivity : WryActivity() {
                 quicMaxConnectionReceiveWindow = quicMaxConnectionReceiveWindow,
                 quicMaxIdleTimeout = quicMaxIdleTimeout,
                 quicKeepAlivePeriod = quicKeepAlivePeriod,
+                localUdpEnabled = localUdpEnabled,
                 quicDisablePathMtuDiscovery = quicDisablePathMtuDiscovery,
                 insecureTls = insecureTls,
             )
@@ -617,6 +658,7 @@ class MainActivity : WryActivity() {
             quicMaxConnectionReceiveWindow: String,
             quicMaxIdleTimeout: String,
             quicKeepAlivePeriod: String,
+            localUdpEnabled: Boolean,
             quicDisablePathMtuDiscovery: Boolean,
             insecureTls: Boolean,
         ): Boolean {
@@ -638,6 +680,7 @@ class MainActivity : WryActivity() {
                     quicMaxConnectionReceiveWindow = quicMaxConnectionReceiveWindow,
                     quicMaxIdleTimeout = quicMaxIdleTimeout,
                     quicKeepAlivePeriod = quicKeepAlivePeriod,
+                    localUdpEnabled = localUdpEnabled,
                     quicDisablePathMtuDiscovery = quicDisablePathMtuDiscovery,
                     insecureTls = insecureTls,
                 ),
@@ -778,6 +821,7 @@ class HysteriaVpnService : VpnService() {
                             it.profile.quicMaxConnectionReceiveWindow,
                             it.profile.quicMaxIdleTimeout,
                             it.profile.quicKeepAlivePeriod,
+                            it.profile.localUdpEnabled,
                             it.profile.quicDisablePathMtuDiscovery,
                             it.profile.insecureTls,
                             true,
@@ -804,13 +848,7 @@ class HysteriaVpnService : VpnService() {
             .setMtu(1500)
             .addAddress("10.8.0.2", 32)
             .addDnsServer("1.1.1.1")
-            .addDnsServer("8.8.8.8")
             .addRoute("0.0.0.0", 0)
-
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-            builder.addAddress("fd00::2", 128)
-            builder.addRoute("::", 0)
-        }
 
         vpnInterface = builder.establish()
         active.set(vpnInterface != null)
@@ -900,6 +938,7 @@ class HysteriaVpnService : VpnService() {
             "profile.quic.max_connection_receive_window"
         private const val KEY_PROFILE_QUIC_MAX_IDLE_TIMEOUT = "profile.quic.max_idle_timeout"
         private const val KEY_PROFILE_QUIC_KEEP_ALIVE_PERIOD = "profile.quic.keep_alive_period"
+        private const val KEY_PROFILE_LOCAL_UDP_ENABLED = "profile.local_udp_enabled"
         private const val KEY_PROFILE_QUIC_DISABLE_PATH_MTU_DISCOVERY =
             "profile.quic.disable_path_mtu_discovery"
         private const val KEY_PROFILE_INSECURE_TLS = "profile.insecure_tls"
@@ -921,6 +960,7 @@ class HysteriaVpnService : VpnService() {
             "managed.quic.max_connection_receive_window"
         private const val KEY_QUIC_MAX_IDLE_TIMEOUT = "managed.quic.max_idle_timeout"
         private const val KEY_QUIC_KEEP_ALIVE_PERIOD = "managed.quic.keep_alive_period"
+        private const val KEY_LOCAL_UDP_ENABLED = "managed.local_udp_enabled"
         private const val KEY_QUIC_DISABLE_PATH_MTU_DISCOVERY =
             "managed.quic.disable_path_mtu_discovery"
         private const val KEY_INSECURE_TLS = "managed.insecure_tls"
@@ -953,6 +993,7 @@ class HysteriaVpnService : VpnService() {
             quicMaxConnectionReceiveWindow: String,
             quicMaxIdleTimeout: String,
             quicKeepAlivePeriod: String,
+            localUdpEnabled: Boolean,
             quicDisablePathMtuDiscovery: Boolean,
             insecureTls: Boolean,
             restoreVpn: Boolean,
@@ -1013,6 +1054,7 @@ class HysteriaVpnService : VpnService() {
                 )
                 .putString(KEY_PROFILE_QUIC_MAX_IDLE_TIMEOUT, profile.quicMaxIdleTimeout)
                 .putString(KEY_PROFILE_QUIC_KEEP_ALIVE_PERIOD, profile.quicKeepAlivePeriod)
+                .putBoolean(KEY_PROFILE_LOCAL_UDP_ENABLED, profile.localUdpEnabled)
                 .putBoolean(
                     KEY_PROFILE_QUIC_DISABLE_PATH_MTU_DISCOVERY,
                     profile.quicDisablePathMtuDiscovery,
@@ -1037,6 +1079,7 @@ class HysteriaVpnService : VpnService() {
                 .remove(KEY_PROFILE_QUIC_MAX_CONNECTION_RECEIVE_WINDOW)
                 .remove(KEY_PROFILE_QUIC_MAX_IDLE_TIMEOUT)
                 .remove(KEY_PROFILE_QUIC_KEEP_ALIVE_PERIOD)
+                .remove(KEY_PROFILE_LOCAL_UDP_ENABLED)
                 .remove(KEY_PROFILE_QUIC_DISABLE_PATH_MTU_DISCOVERY)
                 .remove(KEY_PROFILE_INSECURE_TLS)
                 .apply()
@@ -1078,6 +1121,7 @@ class HysteriaVpnService : VpnService() {
                 )
                 .putString(KEY_QUIC_MAX_IDLE_TIMEOUT, record.profile.quicMaxIdleTimeout)
                 .putString(KEY_QUIC_KEEP_ALIVE_PERIOD, record.profile.quicKeepAlivePeriod)
+                .putBoolean(KEY_LOCAL_UDP_ENABLED, record.profile.localUdpEnabled)
                 .putBoolean(
                     KEY_QUIC_DISABLE_PATH_MTU_DISCOVERY,
                     record.profile.quicDisablePathMtuDiscovery,
@@ -1104,6 +1148,7 @@ class HysteriaVpnService : VpnService() {
                 .remove(KEY_QUIC_MAX_CONNECTION_RECEIVE_WINDOW)
                 .remove(KEY_QUIC_MAX_IDLE_TIMEOUT)
                 .remove(KEY_QUIC_KEEP_ALIVE_PERIOD)
+                .remove(KEY_LOCAL_UDP_ENABLED)
                 .remove(KEY_QUIC_DISABLE_PATH_MTU_DISCOVERY)
                 .remove(KEY_INSECURE_TLS)
                 .remove(KEY_SOCKS_HOST)
@@ -1138,6 +1183,7 @@ class HysteriaVpnService : VpnService() {
                     quicMaxIdleTimeout = prefs.getString(KEY_QUIC_MAX_IDLE_TIMEOUT, "") ?: "",
                     quicKeepAlivePeriod =
                         prefs.getString(KEY_QUIC_KEEP_ALIVE_PERIOD, "") ?: "",
+                    localUdpEnabled = prefs.getBoolean(KEY_LOCAL_UDP_ENABLED, true),
                     quicDisablePathMtuDiscovery =
                         prefs.getBoolean(KEY_QUIC_DISABLE_PATH_MTU_DISCOVERY, false),
                     insecureTls = prefs.getBoolean(KEY_INSECURE_TLS, false),
@@ -1226,6 +1272,7 @@ class HysteriaVpnService : VpnService() {
             quicMaxConnectionReceiveWindow: String,
             quicMaxIdleTimeout: String,
             quicKeepAlivePeriod: String,
+            localUdpEnabled: Boolean,
             quicDisablePathMtuDiscovery: Boolean,
             insecureTls: Boolean,
         ): Boolean {
@@ -1247,6 +1294,7 @@ class HysteriaVpnService : VpnService() {
                     quicMaxConnectionReceiveWindow = quicMaxConnectionReceiveWindow,
                     quicMaxIdleTimeout = quicMaxIdleTimeout,
                     quicKeepAlivePeriod = quicKeepAlivePeriod,
+                    localUdpEnabled = localUdpEnabled,
                     quicDisablePathMtuDiscovery = quicDisablePathMtuDiscovery,
                     insecureTls = insecureTls,
                 ),

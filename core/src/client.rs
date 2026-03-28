@@ -6,6 +6,7 @@ use std::{
         Arc,
         atomic::{AtomicU64, Ordering},
     },
+    time::Duration,
 };
 
 use bytes::Bytes;
@@ -77,6 +78,13 @@ impl ClientConfig {
 pub struct HandshakeInfo {
     pub udp_enabled: bool,
     pub tx: u64,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct TransportSnapshot {
+    pub rtt: Duration,
+    pub tx_bytes: u64,
+    pub rx_bytes: u64,
 }
 
 pub struct Client {
@@ -203,6 +211,19 @@ impl Client {
         self.connection.remote_address()
     }
 
+    pub fn transport_snapshot(&self) -> TransportSnapshot {
+        let stats = self.connection.stats();
+        TransportSnapshot {
+            rtt: self.connection.rtt(),
+            tx_bytes: stats.udp_tx.bytes,
+            rx_bytes: stats.udp_rx.bytes,
+        }
+    }
+
+    pub fn close_reason_text(&self) -> Option<String> {
+        self.connection.close_reason().map(|reason| reason.to_string())
+    }
+
     pub async fn wait_closed(&self) -> CoreError {
         CoreError::Closed(self.connection.closed().await.to_string())
     }
@@ -219,10 +240,9 @@ fn build_client_config(
     config: &ClientConfig,
     bandwidth_target: Arc<AtomicU64>,
 ) -> CoreResult<QuinnClientConfig> {
-    let crypto = RustlsClientConfig::builder_with_provider(Arc::new(
-        rustls::crypto::ring::default_provider(),
-    ))
-    .with_protocol_versions(&[&rustls::version::TLS13])?;
+    let provider = Arc::new(rustls::crypto::ring::default_provider());
+    let crypto = RustlsClientConfig::builder_with_provider(provider.clone())
+        .with_protocol_versions(&[&rustls::version::TLS13])?;
 
     let mut crypto = if config.tls.insecure {
         crypto
@@ -236,7 +256,7 @@ fn build_client_config(
                 .add(cert.clone())
                 .map_err(|err| CoreError::Tls(err.to_string()))?;
         }
-        let verifier = WebPkiServerVerifier::builder(Arc::new(roots))
+        let verifier = WebPkiServerVerifier::builder_with_provider(Arc::new(roots), provider)
             .build()
             .map_err(|err| CoreError::Tls(err.to_string()))?;
         crypto
@@ -346,5 +366,34 @@ impl ServerCertVerifier for SkipServerVerification {
 
     fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
         self.0.signature_verification_algorithms.supported_schemes()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn secure_client_config_without_process_default_provider_does_not_panic() {
+        let config = ClientConfig::new(
+            "127.0.0.1:443".parse().expect("socket addr"),
+            "example.com",
+        );
+
+        let result = std::panic::catch_unwind(|| {
+            build_client_config(&config, Arc::new(AtomicU64::new(0)))
+        });
+
+        match result {
+            Ok(Err(CoreError::Tls(message))) => {
+                assert!(
+                    message.contains("root") || message.contains("anchor"),
+                    "unexpected tls error: {message}"
+                );
+            }
+            Ok(Ok(_)) => panic!("expected TLS config construction to fail without roots"),
+            Ok(Err(other)) => panic!("unexpected error: {other:?}"),
+            Err(_) => panic!("build_client_config panicked without a process default provider"),
+        }
     }
 }
